@@ -1,16 +1,21 @@
 [project]
 name = "bear-agent"
 version = "0.1.0"
-description = "Add your description here"
+description = "Bear-Agent — a local-first, recoverable, extensible agent harness."
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
-    "pydantic-settings>=2.16.2",
     "httpx>=0.28.0",
+    "platformdirs>=4.3.0",
+    "pydantic>=2.10.0",
+    "pydantic-settings>=2.16.2",
+    "rich>=13.9.0",
+    "typer>=0.15.0",
 ]
 
 [project.scripts]
-bear-agent = "bear_agent.main:main"
+bear = "bear_agent.ui.cli.main:app"
+bear-agent = "bear_agent.ui.cli.main:app"
 
 [build-system]
 requires = ["uv_build>=0.13.7,<0.14.0"]
@@ -18,8 +23,50 @@ build-backend = "uv_build"
 
 [dependency-groups]
 dev = [
-    "mypy>=2.4.1",
-    "pytest>=9.2.0",
-    "pytest-cov>=7.1.0",
-    "ruff>=0.17.4",
+    "mypy>=1.14.0",
+    "pytest>=8.3.0",
+    "pytest-asyncio>=0.25.0",
+    "pytest-cov>=6.0.0",
+    "respx>=0.22.0",
+    "ruff>=0.9.0",
 ]
+
+[tool.uv]
+package = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+addopts = "-q"
+
+[tool.coverage.run]
+source = ["bear_agent"]
+branch = true
+
+[tool.ruff]
+target-version = "py313"
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "ASYNC", "RUF"]
+ignore = ["E501"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["S101"]
+# Typer's CLI ergonomics require Option/Argument calls in argument defaults.
+"src/bear_agent/ui/cli/main.py" = ["B008"]
+
+[tool.mypy]
+python_version = "3.13"
+strict = true
+warn_unused_ignores = true
+warn_redundant_casts = true
+plugins = ["pydantic.mypy"]
+mypy_path = "src"
+files = ["src"]
+
+[[tool.mypy.overrides]]
+module = "tests.*"
+disallow_untyped_defs = false

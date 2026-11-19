@@ -1,3 +1,3 @@
-"""Bear Agent — a self-evolving harness agent runtime (built from scratch)."""
+"""Bear-Agent — a local-first, recoverable, extensible agent harness."""
 
 __version__ = "0.1.0"

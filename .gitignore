@@ -1,25 +1,39 @@
-# 虚拟环境
+# Virtual environments
 .venv/
 venv/
 
-# Python 缓存
+# Python caches
 __pycache__/
-*.pyc
-*.pyo
-*.pyd
+*.py[cod]
+*.egg-info/
+build/
+dist/
 
-# 环境变量（含 API Key，绝不能提交）
-.env
-.env.*
-
-# 测试缓存
+# Tool caches
 .pytest_cache/
+.mypy_cache/
+.ruff_cache/
 .coverage
+.coverage.*
+coverage.xml
 htmlcov/
 
-# IDE
+# Secrets — never commit
+.env
+.env.*
+!.env.example
+
+# Bear-Agent local state
+.bear/
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+*.log
+
+# IDE / OS
 .idea/
 .vscode/
-
-# 系统文件
 .DS_Store
+Thumbs.db
