@@ -37,6 +37,37 @@ class ContextOverflowError(BearError):
     pass
 
 
+class ClaimError(BearError):
+    pass
+
+
+class ClaimConflict(ClaimError):
+    def __init__(self, message: str, *, holder: str = "", path: str = "") -> None:
+        super().__init__(message)
+        self.holder = holder
+        self.path = path
+
+
+class SandboxError(BearError):
+    pass
+
+
+class SandboxUnavailable(SandboxError):
+    pass
+
+
+class AuditError(BearError):
+    pass
+
+
+class SecretStoreError(BearError):
+    pass
+
+
+class ApprovalError(BearError):
+    pass
+
+
 @dataclass(slots=True)
 class ProviderError(BearError):
     message: str

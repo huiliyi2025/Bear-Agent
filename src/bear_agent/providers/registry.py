@@ -14,13 +14,14 @@ def create_provider(
     *,
     provider_name: str | None = None,
     model: str | None = None,
+    secret_store: object | None = None,
 ) -> ModelProvider:
     name = provider_name or settings.agent.default_provider
     try:
         provider = settings.provider(name)
     except KeyError as exc:
         raise ConfigError(str(exc)) from exc
-    if not provider.is_local and not provider.resolve_api_key():
+    if not provider.is_local and not provider.resolve_api_key(secret_store):
         env_hint = provider.api_key_env or "BEAR_API_KEY"
         raise ConfigError(
             f"provider {name!r} has no API key. Set {env_hint}, add api_key to the "
@@ -40,6 +41,7 @@ def create_provider(
         provider,
         model=resolved_model,
         capabilities=capabilities,
+        secret_store=secret_store,
     )
     if provider.max_retries <= 0:
         return inner

@@ -41,12 +41,20 @@ class ProviderConfig(BaseModel):
     def _strip_base_url(cls, value: str) -> str:
         return value.rstrip("/")
 
-    def resolve_api_key(self) -> str:
+    def resolve_api_key(self, secret_store: object | None = None) -> str:
         if self.api_key:
-            return _resolve_secret_reference(self.api_key)
+            from bear_agent.secrets.store import resolve_secret_reference
+
+            if self.api_key.startswith(("secret://", "keyring://")) and secret_store is None:
+                return ""
+            return resolve_secret_reference(self.api_key, secret_store)  # type: ignore[arg-type]
         if self.api_key_env:
             return os.environ.get(self.api_key_env, "")
         return ""
+
+    @property
+    def has_secret_reference(self) -> bool:
+        return bool(self.api_key and self.api_key.startswith(("secret://", "keyring://")))
 
     @property
     def is_local(self) -> bool:
@@ -54,21 +62,6 @@ class ProviderConfig(BaseModel):
         return any(
             marker in host for marker in ("localhost", "127.0.0.1", "0.0.0.0", "ollama", "::1")
         )
-
-
-def _resolve_secret_reference(value: str) -> str:
-    """Resolve ``env:NAME`` references; plain values pass through.
-
-    ``keyring://`` is intentionally rejected for now rather than silently treated
-    as a literal key. Phase 2 adds the keyring-backed store.
-    """
-    if value.startswith("env:"):
-        return os.environ.get(value[4:], "")
-    if value.startswith("keyring://"):
-        raise ValueError(
-            "keyring:// secrets are not supported yet; use api_key_env or a plain value for now"
-        )
-    return value
 
 
 class AgentConfig(BaseModel):
@@ -104,12 +97,89 @@ class StorageConfig(BaseModel):
     data_dir: Path | None = None
 
 
+class ShellConfig(BaseModel):
+    enabled: bool = True
+    # Empty = auto-detect /bin/bash then /bin/sh on POSIX.
+    posix_shell: str = ""
+    windows_shell: Literal["powershell", "cmd"] = "powershell"
+    default_timeout_s: float = 120.0
+    max_timeout_s: float = 600.0
+    max_output_bytes: int = 200_000
+    env_allowlist: list[str] = Field(
+        default_factory=lambda: [
+            "PATH",
+            "HOME",
+            "USER",
+            "USERNAME",
+            "USERPROFILE",
+            "HOMEDRIVE",
+            "HOMEPATH",
+            "LANG",
+            "LC_ALL",
+            "TERM",
+            "TMPDIR",
+            "TEMP",
+            "TMP",
+            "SYSTEMROOT",
+            "COMSPEC",
+            "PATHEXT",
+            "WINDIR",
+        ]
+    )
+    env: dict[str, str] = Field(default_factory=dict)
+    allow_commands: list[str] = Field(default_factory=list)
+    allow_prefixes: list[str] = Field(default_factory=list)
+    deny_patterns: list[str] = Field(default_factory=list)
+
+    @field_validator("default_timeout_s", "max_timeout_s", "max_output_bytes")
+    @classmethod
+    def _positive(cls, value: float) -> float:
+        if value <= 0:
+            raise ValueError("must be positive")
+        return value
+
+
+class SandboxConfig(BaseModel):
+    # require: filesystem-capable sandbox or fail closed.
+    # process: process/resource containment is acceptable (Windows Job Object),
+    #          but the result is explicitly marked as lacking filesystem isolation.
+    # off:     explicit opt-out; tools report sandboxed=false.
+    mode: Literal["require", "process", "off"] = "require"
+    network: bool = False
+    read_system: bool = True
+    writable_roots: list[str] = Field(default_factory=list)
+
+
+class SecretsConfig(BaseModel):
+    backend: Literal["keyring", "none"] = "keyring"
+
+
+class AuditConfig(BaseModel):
+    enabled: bool = True
+
+
+class ClaimsConfig(BaseModel):
+    enabled: bool = True
+    ttl_s: float = 600.0
+
+
+class ApprovalConfig(BaseModel):
+    session_ttl_s: float = 86_400.0
+    project_ttl_s: float = 2_592_000.0
+
+
 class Settings(BaseModel):
     providers: dict[str, ProviderConfig] = Field(
         default_factory=lambda: {"default": ProviderConfig()}
     )
     agent: AgentConfig = Field(default_factory=AgentConfig)
     storage: StorageConfig = Field(default_factory=StorageConfig)
+    shell: ShellConfig = Field(default_factory=ShellConfig)
+    sandbox: SandboxConfig = Field(default_factory=SandboxConfig)
+    secrets: SecretsConfig = Field(default_factory=SecretsConfig)
+    audit: AuditConfig = Field(default_factory=AuditConfig)
+    claims: ClaimsConfig = Field(default_factory=ClaimsConfig)
+    approvals: ApprovalConfig = Field(default_factory=ApprovalConfig)
 
     def provider(self, name: str | None = None) -> ProviderConfig:
         provider_name = name or self.agent.default_provider
@@ -131,10 +201,22 @@ class Settings(BaseModel):
             sub.mkdir(parents=True, exist_ok=True)
         return data_dir
 
-    def validate_ready(self, provider_name: str | None = None) -> None:
-        """Validate that the selected provider can actually be used."""
+    def validate_ready(
+        self,
+        provider_name: str | None = None,
+        secret_store: object | None = None,
+    ) -> None:
+        """Validate that the selected provider can actually be used.
+
+        ``secret://`` references are allowed here even before the secret store
+        is available; provider construction resolves them and fails closed.
+        """
         provider = self.provider(provider_name)
-        if not provider.is_local and not provider.resolve_api_key():
+        if (
+            not provider.is_local
+            and not provider.resolve_api_key(secret_store)
+            and not provider.has_secret_reference
+        ):
             raise ValueError(
                 f"provider {provider_name or self.agent.default_provider!r} has no API key. "
                 f"Set {provider.api_key_env or 'BEAR_API_KEY'}, add api_key to the config, "

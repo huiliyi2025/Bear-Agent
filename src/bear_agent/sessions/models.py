@@ -21,7 +21,7 @@ SessionStatus = Literal["active", "idle", "archived"]
 
 def project_id_for(cwd: str | Path) -> str:
     resolved = Path(cwd).resolve()
-    return hashlib.sha256(str(resolved).encode("utf-8")).hexdigest()[:12]
+    return hashlib.sha256(str(resolved).encode("utf-8")).hexdigest()[:32]
 
 
 class SessionRecord(BaseModel):

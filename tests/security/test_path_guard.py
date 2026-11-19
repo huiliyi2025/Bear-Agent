@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
@@ -91,3 +92,18 @@ def test_relative_new_file_is_allowed(tmp_path: Path) -> None:
     path = guard.resolve("new/dir/file.txt", mode="write")
     assert str(path).startswith(str(tmp_path.resolve()))
     assert not path.exists()
+
+
+def test_hardlink_alias_is_blocked(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    secret = workspace / ".env"
+    secret.write_text("SECRET=1", encoding="utf-8")
+    alias = workspace / "notes.txt"
+    try:
+        os.link(secret, alias)
+    except OSError:
+        pytest.skip("hard links are not available on this host")
+    guard = PathGuard(workspace)
+    with pytest.raises(PathAccessError, match="hard-linked"):
+        guard.resolve("notes.txt")

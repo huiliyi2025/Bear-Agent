@@ -33,6 +33,7 @@ from bear_agent.runtime.stop_policy import (
     StopPolicy,
 )
 from bear_agent.runtime.turn_executor import TurnExecutor
+from bear_agent.sessions.claims import ClaimService
 from bear_agent.sessions.service import SessionService
 
 logger = logging.getLogger(__name__)
@@ -68,6 +69,7 @@ class AgentRuntime:
         max_run_seconds: float = 0.0,
         lease_ttl_s: float = 300.0,
         repeated_call_limit: int = 3,
+        claims: ClaimService | None = None,
     ) -> None:
         self.sessions = sessions
         self.turn_executor = turn_executor
@@ -77,6 +79,7 @@ class AgentRuntime:
         self.max_run_seconds = max_run_seconds
         self.lease_ttl_s = lease_ttl_s
         self.repeated_call_limit = repeated_call_limit
+        self.claims = claims
         self._locks: dict[str, asyncio.Lock] = {}
         self._active: dict[str, _ActiveRun] = {}
 
@@ -157,7 +160,9 @@ class AgentRuntime:
                         status = RunStatus.MAX_TURNS
                         reason = f"turn budget exhausted ({self.max_turns})"
                         break
-                    outcome = await self.turn_executor.execute(session, turns, run_id, cancel)
+                    outcome = await self.turn_executor.execute(
+                        session, turns, run_id, owner, cancel
+                    )
                     turns += 1
                     usage = usage + outcome.usage
                     if outcome.response.text:
@@ -195,27 +200,32 @@ class AgentRuntime:
                 heartbeat.cancel()
                 await asyncio.gather(heartbeat, return_exceptions=True)
                 # Cleanup must not be able to turn a completed run into a crash.
-                cleanup: list[tuple[str, Any]] = [
-                    (
-                        "mark interrupted tools",
-                        self.sessions.mark_interrupted_tools_unknown(session_id),
-                    ),
-                    ("release lease", self.sessions.release_lease(session_id, owner, epoch)),
-                    ("set idle", self.sessions.set_status(session_id, "idle")),
-                    (
-                        "record run end",
-                        self._record_run_end(
-                            session_id,
-                            run_id,
-                            status,
-                            turns,
-                            usage,
-                            reason,
-                            error,
-                            final_text,
+                cleanup: list[tuple[str, Any]] = []
+                if self.claims is not None:
+                    cleanup.append(("release claims", self.claims.release_owner(session_id, owner)))
+                cleanup.extend(
+                    [
+                        (
+                            "mark interrupted tools",
+                            self.sessions.mark_interrupted_tools_unknown(session_id),
                         ),
-                    ),
-                ]
+                        ("release lease", self.sessions.release_lease(session_id, owner, epoch)),
+                        ("set idle", self.sessions.set_status(session_id, "idle")),
+                        (
+                            "record run end",
+                            self._record_run_end(
+                                session_id,
+                                run_id,
+                                status,
+                                turns,
+                                usage,
+                                reason,
+                                error,
+                                final_text,
+                            ),
+                        ),
+                    ]
+                )
                 for label, awaitable in cleanup:
                     try:
                         await awaitable
@@ -288,3 +298,10 @@ class AgentRuntime:
             if not renewed:
                 cancel.cancel()
                 return
+            if self.claims is not None:
+                try:
+                    await self.claims.renew_owner(session_id, owner, self.lease_ttl_s)
+                except Exception:  # losing claims must stop the run
+                    logger.exception("claim heartbeat failed")
+                    cancel.cancel()
+                    return

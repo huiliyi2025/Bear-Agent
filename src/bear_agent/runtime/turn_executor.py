@@ -69,6 +69,7 @@ class TurnExecutor:
         session: SessionRecord,
         turn_index: int,
         run_id: str,
+        lease_owner: str,
         cancel: CancelToken,
     ) -> TurnOutcome:
         turn_id = new_id("turn")
@@ -200,6 +201,8 @@ class TurnExecutor:
             result = await self.tool_executor.execute(
                 call,
                 session_id=session.id,
+                project_id=session.project_id,
+                lease_owner=lease_owner,
                 run_id=run_id,
                 turn_id=turn_id,
                 cancel=cancel,

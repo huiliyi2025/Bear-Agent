@@ -11,7 +11,7 @@ from pathlib import Path
 
 from pydantic import BaseModel, Field
 
-from bear_agent.policy.path_guard import PathAccessError
+from bear_agent.policy.path_guard import PathAccessError, is_sensitive_path
 from bear_agent.tools.base import Tool, ToolContext, ToolResult
 
 IGNORED_DIRS = {
@@ -150,8 +150,13 @@ class GrepTool(Tool):
                     continue
                 if _ignored(candidate, root):
                     continue
+                if is_sensitive_path(str(candidate))[0]:
+                    continue
                 try:
-                    if candidate.stat().st_size > MAX_GREP_FILE_BYTES:
+                    stat = candidate.stat()
+                    if stat.st_nlink > 1:
+                        continue
+                    if stat.st_size > MAX_GREP_FILE_BYTES:
                         continue
                     with candidate.open("rb") as handle:
                         sample = handle.read(8192)

@@ -1,32 +1,25 @@
-# ADR 0002: Event-sourced sessions with SQLite as the source of truth
+# ADR 0002：事件溯源会话，SQLite 作为状态真源
 
-- Status: Accepted
-- Date: 2026-11-19
+- 状态：已采纳
+- 日期：2026-11-19
 
-## Context
+## 背景
 
-The harness must support tracing, recovery, UI rendering and usage accounting.
-A mutable "messages only" store loses the facts needed to explain a run and to
-resume after a crash. Pure in-memory state is not durable.
+Harness 需要支持追踪、恢复、UI 渲染和用量核算。只保存可变“消息”的存储会丢失解释一次运行和崩溃恢复所需的事实。纯内存状态不可持久。
 
-## Decision
+## 决策
 
-Persist every fact event with a per-session monotonic `seq`. Messages,
-tool-call rows and events are written in explicit transactions. SQLite (WAL) is
-the durable source of truth; large payloads will move to an artifact store in
-P3. State is derived from rows plus events; side effects are never replayed.
+每个事实事件都带会话内单调递增的 `seq` 持久化。消息、工具调用行与事件都在显式事务中写入。SQLite（WAL）是持久化真源；大 payload 在 P3 迁移到 artifact 存储。状态由数据行 + 事件推导；副作用绝不重放。
 
-## Consequences
+## 影响
 
-- A complete audit trail and deterministic UI/trace replay.
-- Recovery can distinguish completed, failed, cancelled and unknown tool calls.
-- Events add write volume; streaming deltas are therefore ephemeral and only
-  final messages/facts are persisted.
-- Schema migrations are a first-class concern.
+- 完整的审计轨迹与确定性的 UI/Trace 回放。
+- 恢复时可以区分 completed、failed、cancelled、unknown 工具调用。
+- 事件增加写体积；因此流式 delta 是瞬态的，只持久化最终消息/事实。
+- Schema 迁移成为一等公民。
 
-## Alternatives
+## 备选方案
 
-- JSONL transcript only: simple, but weak querying and transactional invariants.
-- ORM: rejected; explicit SQL keeps the fencing/transaction behavior auditable.
-- Event-only store with no message table: rejected because the runtime needs a
-  fast ordered transcript and message pairing checks.
+- 仅 JSONL 转录：简单，但查询能力弱、缺少事务不变量。
+- ORM：拒绝；显式 SQL 让 fencing/事务行为可审计。
+- 只有事件表、没有消息表：拒绝；Runtime 需要快速有序的转录和消息配对校验。

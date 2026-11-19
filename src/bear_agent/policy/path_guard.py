@@ -112,6 +112,14 @@ class PathGuard:
             raise PathAccessError(
                 "writing inside .git is blocked; use git commands through the harness"
             )
+        try:
+            if canonical.is_file() and canonical.stat().st_nlink > 1:
+                raise PathAccessError(
+                    f"hard-linked file blocked: {raw_path}. A hard link can alias a "
+                    "sensitive file under an innocuous name; use a regular file."
+                )
+        except FileNotFoundError:
+            pass
         return canonical
 
     def relative(self, path: Path) -> str:

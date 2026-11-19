@@ -15,9 +15,10 @@ from pathlib import Path
 
 from pydantic import BaseModel, Field
 
+from bear_agent.core.errors import ClaimError
 from bear_agent.core.modes import ToolSideEffect
 from bear_agent.policy.path_guard import PathAccessError
-from bear_agent.tools.base import Tool, ToolContext, ToolResult
+from bear_agent.tools.base import ClaimRequest, Tool, ToolContext, ToolResult
 
 MAX_READ_BYTES = 2 * 1024 * 1024
 MAX_READ_LINES = 5_000
@@ -98,6 +99,8 @@ class ReadFileTool(Tool):
             return _error(f"file not found: {path}", "not_found")
         if path.is_dir():
             return _error(f"path is a directory: {path}", "invalid_argument")
+        if not path.is_file():
+            return _error(f"path is not a regular file: {path}", "invalid_argument")
         try:
             size = path.stat().st_size
             if size > MAX_READ_BYTES:
@@ -146,13 +149,27 @@ class WriteFileTool(Tool):
     idempotent = True
     concurrency_safe = False
 
+    def claim_paths(self, args: BaseModel) -> list[ClaimRequest]:
+        assert isinstance(args, WriteFileArgs)
+        return [ClaimRequest(path=args.path, scope="file")]
+
     async def run(self, args: BaseModel, ctx: ToolContext) -> ToolResult:
         assert isinstance(args, WriteFileArgs)
+        if not ctx.approved:
+            return _error(
+                "write_file invoked outside the tool executor authorization chain",
+                "approval_required",
+            )
         try:
             path = _resolve_write(ctx, args.path)
         except PathAccessError as exc:
             return _error(str(exc), "path_denied")
         existed = path.exists()
+        try:
+            if ctx.assert_write_allowed is not None:
+                await ctx.assert_write_allowed(str(path))
+        except ClaimError as exc:
+            return _error(f"write fenced: {exc}", "claim_fenced")
         try:
             _atomic_write(path, args.content)
         except OSError as exc:
@@ -177,8 +194,17 @@ class EditFileTool(Tool):
     idempotent = True
     concurrency_safe = False
 
+    def claim_paths(self, args: BaseModel) -> list[ClaimRequest]:
+        assert isinstance(args, EditFileArgs)
+        return [ClaimRequest(path=args.path, scope="file")]
+
     async def run(self, args: BaseModel, ctx: ToolContext) -> ToolResult:
         assert isinstance(args, EditFileArgs)
+        if not ctx.approved:
+            return _error(
+                "edit_file invoked outside the tool executor authorization chain",
+                "approval_required",
+            )
         if not args.old_string:
             return _error("old_string must not be empty", "invalid_argument")
         if args.old_string == args.new_string:
@@ -191,6 +217,8 @@ class EditFileTool(Tool):
             return _error(f"file not found: {path}", "not_found")
         if path.is_dir():
             return _error(f"path is a directory: {path}", "invalid_argument")
+        if not path.is_file():
+            return _error(f"path is not a regular file: {path}", "invalid_argument")
         try:
             text = path.read_text(encoding="utf-8")
         except (UnicodeDecodeError, OSError) as exc:
@@ -207,6 +235,11 @@ class EditFileTool(Tool):
                 "ambiguous_match",
             )
         updated = text.replace(args.old_string, args.new_string, 1)
+        try:
+            if ctx.assert_write_allowed is not None:
+                await ctx.assert_write_allowed(str(path))
+        except ClaimError as exc:
+            return _error(f"write fenced: {exc}", "claim_fenced")
         try:
             _atomic_write(path, updated)
         except OSError as exc:

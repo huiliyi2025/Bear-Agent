@@ -19,6 +19,20 @@ class PolicyDecision:
     reason: str
 
 
+class ApprovalScope(StrEnum):
+    ONCE = "once"
+    SESSION = "session"
+    PROJECT = "project"
+    DENY = "deny"
+
+
+@dataclass(frozen=True, slots=True)
+class ApprovalDecision:
+    approved: bool
+    scope: ApprovalScope = ApprovalScope.DENY
+    reason: str = ""
+
+
 @dataclass(frozen=True, slots=True)
 class ApprovalRequest:
     tool_name: str
@@ -26,3 +40,10 @@ class ApprovalRequest:
     reason: str = ""
     risk: str = "moderate"
     session_id: str = ""
+    project_id: str | None = None
+    fingerprint: str = ""
+    scope_options: tuple[ApprovalScope, ...] = (
+        ApprovalScope.ONCE,
+        ApprovalScope.SESSION,
+        ApprovalScope.PROJECT,
+    )

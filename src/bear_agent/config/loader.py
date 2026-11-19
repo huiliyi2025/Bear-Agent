@@ -40,6 +40,37 @@ base_url = "https://api.deepseek.com/v1"
 api_key_env = "DEEPSEEK_API_KEY"
 models = ["deepseek-chat", "deepseek-reasoner"]
 
+[shell]
+enabled = true
+default_timeout_s = 120
+max_timeout_s = 600
+max_output_bytes = 200000
+allow_commands = []       # exact executable names that skip approval in auto mode
+allow_prefixes = []       # command prefixes that skip approval in auto mode
+deny_patterns = []        # extra hard-deny regexes (always win)
+
+[sandbox]
+# require: filesystem-capable OS sandbox or fail closed
+# process: process-only containment (Windows Job Object) is accepted and reported
+# off:     explicit opt-out; shell runs without OS isolation
+mode = "require"
+network = false
+read_system = true
+
+[secrets]
+backend = "keyring"
+
+[audit]
+enabled = true
+
+[claims]
+enabled = true
+ttl_s = 600
+
+[approvals]
+session_ttl_s = 86400
+project_ttl_s = 2592000
+
 # Any OpenAI-compatible endpoint works, including Ollama / vLLM / a relay:
 # [providers.local]
 # type = "openai_compat"
@@ -197,6 +228,35 @@ def settings_to_toml(settings: Settings) -> str:
     ):
         value = getattr(agent, key)
         lines.append(f"{key} = {_toml_value(value)}")
+    lines.extend(["", "[shell]"])
+    shell = settings.shell
+    for key in (
+        "enabled",
+        "posix_shell",
+        "windows_shell",
+        "default_timeout_s",
+        "max_timeout_s",
+        "max_output_bytes",
+        "env_allowlist",
+        "allow_commands",
+        "allow_prefixes",
+        "deny_patterns",
+    ):
+        lines.append(f"{key} = {_toml_value(getattr(shell, key))}")
+    lines.extend(["", "[sandbox]"])
+    sandbox = settings.sandbox
+    for key in ("mode", "network", "read_system", "writable_roots"):
+        lines.append(f"{key} = {_toml_value(getattr(sandbox, key))}")
+    lines.extend(["", "[secrets]"])
+    lines.append(f"backend = {_toml_value(settings.secrets.backend)}")
+    lines.extend(["", "[audit]"])
+    lines.append(f"enabled = {_toml_value(settings.audit.enabled)}")
+    lines.extend(["", "[claims]"])
+    lines.append(f"enabled = {_toml_value(settings.claims.enabled)}")
+    lines.append(f"ttl_s = {_toml_value(settings.claims.ttl_s)}")
+    lines.extend(["", "[approvals]"])
+    lines.append(f"session_ttl_s = {_toml_value(settings.approvals.session_ttl_s)}")
+    lines.append(f"project_ttl_s = {_toml_value(settings.approvals.project_ttl_s)}")
     for name, provider in settings.providers.items():
         lines.append("")
         lines.append(f"[providers.{name}]")

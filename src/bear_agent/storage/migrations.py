@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import sqlite3
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 SCHEMA_V1 = """
@@ -119,6 +119,43 @@ CREATE TABLE IF NOT EXISTS audit_log (
     hash TEXT NOT NULL,
     created_at TEXT NOT NULL
 );
+CREATE INDEX IF NOT EXISTS idx_audit_log_id ON audit_log (id);
+"""
+
+SCHEMA_V2 = """
+CREATE TABLE IF NOT EXISTS approvals (
+    id TEXT PRIMARY KEY,
+    session_id TEXT,
+    project_id TEXT,
+    fingerprint TEXT NOT NULL,
+    tool_name TEXT NOT NULL,
+    scope TEXT NOT NULL CHECK (scope IN ('once', 'session', 'project')),
+    decision TEXT NOT NULL CHECK (decision IN ('allow', 'deny')),
+    reason TEXT,
+    created_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_approvals_lookup
+    ON approvals (fingerprint, session_id, project_id, expires_at);
+
+CREATE TABLE IF NOT EXISTS file_claims (
+    id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL,
+    lease_owner TEXT NOT NULL,
+    path TEXT NOT NULL,
+    scope TEXT NOT NULL CHECK (scope IN ('file', 'tree')),
+    mode TEXT NOT NULL CHECK (mode IN ('exclusive', 'shared_read')),
+    acquired_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    UNIQUE (session_id, path)
+);
+CREATE INDEX IF NOT EXISTS idx_file_claims_path ON file_claims (path);
+CREATE INDEX IF NOT EXISTS idx_file_claims_session ON file_claims (session_id);
+
+CREATE TABLE IF NOT EXISTS secret_names (
+    name TEXT PRIMARY KEY,
+    created_at TEXT NOT NULL
+);
 """
 
 
@@ -136,4 +173,8 @@ def migrate(conn: sqlite3.Connection) -> None:
             conn.execute("UPDATE schema_meta SET version = 1")
         else:
             conn.execute("INSERT INTO schema_meta (version) VALUES (1)")
+        version = 1
+    if version < 2:
+        conn.executescript(SCHEMA_V2)
+        conn.execute("UPDATE schema_meta SET version = 2")
     conn.commit()

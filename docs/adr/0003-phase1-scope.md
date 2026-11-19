@@ -1,33 +1,24 @@
-# ADR 0003: Phase 1 scope — safe file tools before shell tools
+# ADR 0003：阶段 1 范围——先做安全文件工具，再做 Shell
 
-- Status: Accepted
-- Date: 2026-11-19
+- 状态：已采纳
+- 日期：2026-11-19
 
-## Context
+## 背景
 
-Phase 0 defined P1 as the kernel and P2 as tools + security. Shipping a usable
-kernel requires write operations, but shell execution and OS sandbox support
-are much larger security surfaces. Deferring all writes would make P1 a read-only
-demo and force a premature redesign of the tool pipeline.
+阶段 0 把 P1 定义为内核，把 P2 定义为工具 + 安全。可用的内核需要写操作，但 Shell 执行和 OS Sandbox 是更大的安全面。完全推迟写操作会让 P1 变成只读 Demo，并迫使工具流水线提前重构。
 
-## Decision
+## 决策
 
-P1 includes `read_file`, `write_file`, `edit_file`, `list_dir`, `glob` and
-`grep`, together with `PathGuard` and the permission matrix. Shell execution,
-OS sandbox, approval scopes, secret store and audit chaining are deferred to P2.
-No side-effecting tool may bypass `PathGuard`, even in `unrestricted` mode.
+P1 包含 `read_file`、`write_file`、`edit_file`、`list_dir`、`glob`、`grep`，以及 `PathGuard` 和权限矩阵。Shell 执行、OS Sandbox、审批作用域、密钥存储、审计链推迟到 P2。任何有副作用的工具都不能绕过 `PathGuard`，即使 `unrestricted` 模式也不行。
 
-## Consequences
+## 影响
 
-- P1 is genuinely usable for repository analysis and safe edits.
-- The tool executor, policy matrix and path guard are exercised by real tools.
-- `bash` and process isolation remain a known risk, but the capability is not
-  exposed yet, so there is no claim of mitigation.
-- P2 can add execution without restructuring the kernel.
+- P1 对仓库分析和安全编辑真正可用。
+- 工具执行器、权限矩阵、路径守卫由真实工具验证。
+- `bash` 与进程隔离仍是已知风险，但能力尚未暴露，因此不声称已缓解。
+- P2 可以在不重构内核的前提下增加执行能力。
 
-## Alternatives
+## 备选方案
 
-- Read-only P1: lower risk, but a weaker foundation and a likely redesign of
-  write/approval paths in P2.
-- All tools in P1: rejected; shell sandbox is a phase-sized problem and would
-  delay the kernel validation.
+- 只读 P1：风险更低，但基础更弱，P2 很可能重写写入/审批路径。
+- 所有工具都进 P1：拒绝；Shell Sandbox 是阶段级问题，会拖慢内核验证。

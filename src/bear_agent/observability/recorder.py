@@ -12,13 +12,20 @@ from typing import Any
 from bear_agent.core.errors import StorageError
 from bear_agent.core.events import PERSISTED_EVENT_TYPES, Event, EventType
 from bear_agent.observability.bus import EventBus
+from bear_agent.secrets.redaction import SecretRedactor
 from bear_agent.sessions.service import SessionService
 
 
 class EventRecorder:
-    def __init__(self, sessions: SessionService, bus: EventBus) -> None:
+    def __init__(
+        self,
+        sessions: SessionService,
+        bus: EventBus,
+        redactor: SecretRedactor | None = None,
+    ) -> None:
         self.sessions = sessions
         self.bus = bus
+        self.redactor = redactor or SecretRedactor()
 
     async def record(
         self,
@@ -31,11 +38,12 @@ class EventRecorder:
         persist: bool | None = None,
     ) -> Event:
         should_persist = event_type in PERSISTED_EVENT_TYPES if persist is None else persist
+        safe_payload = self.redactor.redact_obj(payload or {})
         if should_persist:
             event = await self.sessions.append_event(
                 session_id,
                 event_type,
-                payload=payload,
+                payload=safe_payload,
                 run_id=run_id,
                 turn_id=turn_id,
             )
@@ -45,7 +53,7 @@ class EventRecorder:
             event = Event(
                 session_id=session_id,
                 type=event_type,
-                payload=payload or {},
+                payload=safe_payload,
                 run_id=run_id,
                 turn_id=turn_id,
             )

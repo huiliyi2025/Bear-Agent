@@ -25,6 +25,10 @@ jobs:
           python-version: "3.13"
           enable-cache: true
 
+      - name: Install bubblewrap (Linux sandbox tests)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y bubblewrap
+
       - name: Install dependencies
         run: uv sync --frozen
 

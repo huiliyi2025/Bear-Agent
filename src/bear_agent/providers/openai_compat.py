@@ -93,11 +93,13 @@ class OpenAICompatProvider(ModelProvider):
         *,
         model: str,
         capabilities: ModelCapabilities,
+        secret_store: object | None = None,
     ) -> None:
         self.name = name
         self.config = config
         self.model = model
         self.capabilities = capabilities
+        self.secret_store = secret_store
         self._client: httpx.AsyncClient | None = None
 
     def _get_client(self) -> httpx.AsyncClient:
@@ -115,7 +117,7 @@ class OpenAICompatProvider(ModelProvider):
 
     def _headers(self) -> dict[str, str]:
         headers = {"Content-Type": "application/json", **self.config.headers}
-        key = self.config.resolve_api_key()
+        key = self.config.resolve_api_key(self.secret_store)
         if key:
             headers["Authorization"] = f"Bearer {key}"
         return headers

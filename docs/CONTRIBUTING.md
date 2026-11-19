@@ -1,17 +1,15 @@
-# Contributing
+# 贡献指南
 
-Thanks for helping build Bear-Agent. This project is developed in phases; keep
-changes aligned with the current phase and do not claim deferred features as
-done.
+感谢参与 Bear-Agent。项目按阶段推进；请让改动与当前阶段一致，不要把推迟的功能说成已完成。
 
-## Before you start
+## 开始之前
 
-- Read `docs/ARCHITECTURE.md`, `docs/ROADMAP.md` and `docs/SECURITY.md`.
-- Check the current phase in `docs/ROADMAP.md`.
-- For a bug fix, add a regression test first.
-- For a security change, include a test that demonstrates the boundary.
+- 阅读 `docs/ARCHITECTURE.md`、`docs/ROADMAP.md` 与 `docs/SECURITY.md`。
+- 在 `docs/ROADMAP.md` 确认当前阶段。
+- 修复 Bug 时先补回归测试。
+- 安全改动必须附带能证明边界的测试。
 
-## Development setup
+## 开发环境
 
 ```bash
 uv sync
@@ -21,61 +19,64 @@ uv run ruff format --check src tests
 uv run mypy src
 ```
 
-## Pull requests
+## Pull Request
 
-1. Keep the change scoped; avoid unrelated refactors.
-2. Add or update tests. New behavior without tests is not complete.
-3. Update docs and `ROADMAP.md` when scope or behavior changes.
-4. Do not commit `.env`, API keys, local databases, generated caches or
-   user-specific paths.
-5. Do not weaken a security boundary to make a test pass. Explain exceptions.
-6. Do not add a dependency without a concrete need and a note in the PR.
+1. 改动保持聚焦，避免无关重构。
+2. 新增或更新测试。没有测试的新行为不算完成。
+3. 范围或行为变化时更新文档与 `ROADMAP.md`。
+4. 不要提交 `.env`、API Key、本地数据库、生成缓存或用户特定路径。
+5. 不要为了让测试通过而削弱安全边界。例外必须在 PR 中解释。
+6. 没有明确需要不要在 PR 中新增依赖。
 
-## Code style
+## 代码风格
 
-- Python 3.13, `from __future__ import annotations`, type hints on public APIs.
-- Pydantic v2 models for data crossing a boundary; dataclasses for internal
-  value objects where validation is unnecessary.
-- Async for I/O; never block the event loop with filesystem/network work in a
-  coroutine without `asyncio.to_thread` or an injected adapter.
-- Explicit SQL over ORM magic; transactions around multi-row invariants.
-- Comments explain *why* and invariants, not restate the code.
-- Error messages should be actionable and safe (no secrets, no stack traces to
-  the model by default).
+- Python 3.13，`from __future__ import annotations`，公共 API 必须有类型标注。
+- 跨边界数据使用 Pydantic v2 模型；内部 value object 在不需要校验时用 dataclass。
+- I/O 使用 async；协程中不得直接阻塞事件循环做文件/网络操作，应使用 `asyncio.to_thread` 或注入适配器。
+- 显式 SQL 优于 ORM 魔法；多行不变量使用事务。
+- 注释解释**为什么**与不变量，不复述代码。
+- 错误信息应可行动且安全（默认不把密钥或堆栈返回给模型）。
 
-## Adding a tool
+## 添加工具
 
-See `docs/DEVELOPMENT.md#adding-a-tool`. Required tests:
+见 `docs/DEVELOPMENT.md#adding-a-tool`。必须覆盖：
 
-- success path;
-- invalid arguments;
-- path denied (if it touches the filesystem);
-- timeout/cancellation behavior;
-- event/tool-call persistence if side-effecting.
+- 成功路径；
+- 非法参数；
+- 路径拒绝（如果访问文件系统）；
+- 超时/取消行为；
+- 有副作用时的事件/tool_call 持久化。
 
-## Adding a provider
+## 添加 Provider
 
-See `docs/DEVELOPMENT.md#adding-a-provider`. Providers must:
+见 `docs/DEVELOPMENT.md#adding-a-provider`。Provider 必须：
 
-- implement the `ModelProvider` port;
-- normalize usage;
-- classify retryable failures;
-- never leak API keys in errors;
-- pass a fixture-based conformance test.
+- 实现 `ModelProvider` 端口；
+- 归一化 usage；
+- 分类可重试失败；
+- 不在错误中泄露 API Key；
+- 通过基于 fixture 的一致性测试。
 
-## Architecture rules
+## 架构规则
 
-- `core` has no harness dependencies.
-- `ui` may depend inward; the kernel must never import `ui`.
-- `tools` must not import `runtime`.
-- `policy` must not import `tools.base` (use the `ToolLike` protocol).
-- Adapters are constructed only in `bootstrap.py`.
-- New cross-layer dependencies require an ADR if they change a boundary.
+- `core` 不依赖 Harness。
+- `ui` 可以向内依赖；内核绝不能 import `ui`。
+- `tools` 不能 import `runtime`。
+- `policy` 不能 import `tools.base`（使用 `ToolLike` 协议）。
+- 适配器只在 `bootstrap.py` 构造。
+- 改变边界的跨层依赖需要 ADR。
 
-## Commit messages
+## 安全改动
 
-Use a short imperative subject, then a body explaining why and what was
-verified. Example:
+- 有副作用的工具需要 `preflight` 分析、`claim_paths`、审计记录与安全测试。
+- 绝不在 `shell/runner.py` 之外 spawn Shell 命令。
+- 绝不增加明文密钥回退；使用 `SecretManager` 并把值注册到脱敏器。
+- 安全决策必须在副作用前持久化；执行前审计失败会中止动作。
+- 不要把仅进程级 Sandbox 描述成文件系统隔离。
+
+## Commit Message
+
+使用简短祈使句标题，正文解释原因与验证内容。示例：
 
 ```text
 Add bounded tool executor retries
@@ -84,12 +85,10 @@ Tool timeouts now return a structured error and persist a failed tool_call row.
 Tests cover timeout, denial and unknown-tool paths.
 ```
 
-## Reporting issues
+## 报告问题
 
-Include the command, config shape (redacted), expected vs actual behavior, and
-the relevant event/session id. Never paste API keys or private source code.
+请包含命令、配置形态（已脱敏）、期望行为与实际行为，以及相关 event/session id。绝不要粘贴 API Key 或私有源码。
 
-## License
+## 许可证
 
-By contributing, you agree that your contributions are licensed under
-Apache-2.0 (see `LICENSE`).
+参与贡献即表示你同意以 Apache-2.0 授权你的贡献（见 `LICENSE`）。

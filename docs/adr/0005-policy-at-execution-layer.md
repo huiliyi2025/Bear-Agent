@@ -1,36 +1,31 @@
-# ADR 0005: Permissions are enforced at the execution layer
+# ADR 0005：权限在执行层强制实施
 
-- Status: Accepted
-- Date: 2026-11-19
+- 状态：已采纳
+- 日期：2026-11-19
 
-## Context
+## 背景
 
-Prompt instructions such as "do not read .env" are suggestions to a
-probabilistic model. A malicious repository or a prompt injection can override
-them. The harness needs deterministic, testable boundaries.
+“不要读取 .env”这类 Prompt 只是对概率模型的建议，恶意仓库或 Prompt Injection 可以覆盖。Harness 需要确定性、可测试的边界。
 
-## Decision
+## 决策
 
-Enforce permissions in the tool executor and path guard, not only in the system
-prompt:
+在工具执行器与路径守卫中强制权限，而不只在 System Prompt 中请求：
 
-- `PermissionEngine` returns allow/ask/deny from the tool's declared side effect
-  and the session mode.
-- `PathGuard` resolves and canonicalizes every path before a tool sees it.
-- Sensitive files and `.git` writes are denied in code.
-- The executor validates arguments, applies approval, enforces timeouts and
-  persists every decision as an event.
-- Security controls fail closed and return actionable errors.
+- `PermissionEngine` 根据工具声明的副作用与会话模式返回 allow/ask/deny。
+- `PathGuard` 在工具看到路径之前解析并规范化每个路径。
+- 敏感文件与 `.git` 写入在代码中拒绝。
+- 执行器校验参数、应用审批、执行超时，并把每个决策持久化为事件。
+- 安全控制 fail-closed，并返回可行动的错误。
 
-## Consequences
+## 影响
 
-- The model cannot override a deny by writing a persuasive prompt.
-- New tools must declare side effects and use the path guard.
-- The policy layer is independently testable (matrix and path corpus).
-- Some legitimate actions need explicit approval; this is intentional.
+- 模型无法通过写一段有说服力的 Prompt 覆盖拒绝。
+- 新工具必须声明副作用并使用路径守卫。
+- 策略层可独立测试（矩阵与路径语料）。
+- 部分合法操作需要显式审批；这是有意设计。
 
-## Alternatives
+## 备选方案
 
-- Prompt-only restrictions: rejected; not enforceable.
-- Blocking at the UI layer: rejected; headless and API surfaces would bypass it.
-- Post-hoc auditing only: rejected; damage is already done.
+- 仅 Prompt 限制：拒绝；不可强制。
+- 在 UI 层阻断：拒绝；无头与 API 表面会绕过。
+- 只做事后审计：拒绝；损害已经发生。

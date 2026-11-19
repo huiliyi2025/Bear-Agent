@@ -95,5 +95,5 @@ async def test_interrupted_tool_marked_unknown(tmp_path: Path) -> None:
 
 def test_session_project_id(tmp_path: Path) -> None:
     session = SessionRecord.new(cwd=tmp_path, model="m", provider="p")
-    assert len(session.project_id) == 12
+    assert len(session.project_id) == 32
     assert session.cwd == str(tmp_path.resolve())

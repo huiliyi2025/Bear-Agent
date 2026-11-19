@@ -1,32 +1,24 @@
-# ADR 0001: Python 3.13 + asyncio for the kernel
+# ADR 0001：内核使用 Python 3.13 + asyncio
 
-- Status: Accepted
-- Date: 2026-11-19
+- 状态：已采纳
+- 日期：2026-11-19
 
-## Context
+## 背景
 
-The repository started as a Python skeleton. The harness is I/O-bound (model
-streams, tools, SQLite) and needs fast iteration, a mature ecosystem and easy
-installation for developers. A TypeScript implementation would mirror the
-reference project but would require rewriting the existing code and toolchain.
+仓库最初是 Python 骨架。Harness 属于 I/O 密集型（模型流、工具、SQLite），需要快速迭代、成熟生态和简单的安装体验。改用 TypeScript 会贴近参考项目，但需要重写现有代码与工具链。
 
-## Decision
+## 决策
 
-Use Python 3.13, asyncio, Pydantic v2, httpx and uv. Keep the core
-provider-neutral and UI-agnostic. Defer any performance-sensitive native
-component until profiling proves it necessary.
+使用 Python 3.13、asyncio、Pydantic v2、httpx 与 uv。内核保持 Provider 中立、与 UI 无关。任何性能敏感的原生组件都推迟到 profiling 证明必要时再引入。
 
-## Consequences
+## 影响
 
-- Fast development and strong typing via mypy/Pydantic.
-- Packaging via `uv tool install` / wheels; no Node runtime requirement.
-- CPU-bound work must be offloaded to threads/processes; the runtime is designed
-  for I/O concurrency, not parallel CPU.
-- A future single-binary distribution can use PyInstaller/Nuitka without
-  changing the architecture.
+- 开发快，并通过 mypy/Pydantic 获得较强类型约束。
+- 通过 `uv tool install` / wheel 分发，不要求 Node 运行时。
+- CPU 密集工作必须交给线程/进程；Runtime 面向 I/O 并发，不面向并行 CPU。
+- 未来的单二进制分发可以使用 PyInstaller/Nuitka，而无需改变架构。
 
-## Alternatives
+## 备选方案
 
-- TypeScript (Tianshu stack): rejected for migration cost; revisit only if the
-  project needs browser-native extensions or a Node-only dependency.
-- Rust: rejected for iteration speed at this stage.
+- TypeScript（天枢技术栈）：因迁移成本被拒绝；只有项目需要浏览器原生扩展或 Node 专属依赖时再考虑。
+- Rust：当前阶段因迭代速度被拒绝。

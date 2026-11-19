@@ -274,3 +274,27 @@ async def test_running_session_rejects_concurrent_run(workspace: Path, settings)
         await asyncio.wait_for(task, timeout=10)
     finally:
         await container.close()
+
+
+@pytest.mark.asyncio
+async def test_file_claim_conflict_reaches_model(workspace: Path, settings) -> None:
+    scripts = [
+        tool_script("c1", "write_file", {"path": "locked.txt", "content": "b"}),
+        text_script("blocked by claim"),
+    ]
+    container, _provider = make_container(settings, workspace, scripts)
+    try:
+        session_a = await new_session(container, workspace)
+        session_b = await new_session(container, workspace)
+        owner = "manual-claim-owner"
+        await container.sessions.acquire_lease(session_a.id, owner, 300)
+        await container.claims.acquire(session_a.id, owner, "locked.txt")
+        result = await container.runtime.run(session_b.id, "write locked")
+        assert result.status == RunStatus.COMPLETED
+        messages = await container.sessions.load_messages(session_b.id)
+        tool_text = _tool_text(messages[2])
+        assert "conflicts with a claim" in tool_text
+        assert not (workspace / "locked.txt").exists()
+        await container.claims.release_owner(session_a.id, owner)
+    finally:
+        await container.close()

@@ -49,6 +49,9 @@ class EventType(StrEnum):
     POLICY_DECISION = "policy.decision"
     APPROVAL_REQUESTED = "approval.requested"
     APPROVAL_DECIDED = "approval.decided"
+    SANDBOX_DECISION = "sandbox.decision"
+    CLAIM_ACQUIRED = "claim.acquired"
+    CLAIM_CONFLICT = "claim.conflict"
 
     # Context
     CONTEXT_BUILT = "context.built"
@@ -85,6 +88,9 @@ PERSISTED_EVENT_TYPES: frozenset[EventType] = frozenset(
         EventType.POLICY_DECISION,
         EventType.APPROVAL_REQUESTED,
         EventType.APPROVAL_DECIDED,
+        EventType.SANDBOX_DECISION,
+        EventType.CLAIM_ACQUIRED,
+        EventType.CLAIM_CONFLICT,
         EventType.CONTEXT_BUILT,
         EventType.CONTEXT_TRUNCATED,
     }

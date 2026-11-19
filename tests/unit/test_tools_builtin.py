@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import os
+import sys
 from pathlib import Path
 
 import pytest
 
 from bear_agent.core.cancel import CancelToken
+from bear_agent.core.errors import ClaimError
 from bear_agent.policy.path_guard import PathGuard
 from bear_agent.tools.base import Tool, ToolContext, ToolResult
 from bear_agent.tools.builtin import (
@@ -17,13 +20,22 @@ from bear_agent.tools.builtin import (
 )
 
 
-async def _call(tool: Tool, workspace: Path, **kwargs: object) -> ToolResult:
+async def _call(
+    tool: Tool,
+    workspace: Path,
+    *,
+    assert_write_allowed: object | None = None,
+    approved: bool = True,
+    **kwargs: object,
+) -> ToolResult:
     args = tool.args_model.model_validate(kwargs)
     ctx = ToolContext(
         cwd=workspace,
         session_id="test",
         cancel=CancelToken(),
         path_guard=PathGuard(workspace),
+        approved=approved,
+        assert_write_allowed=assert_write_allowed,  # type: ignore[arg-type]
     )
     return await tool.run(args, ctx)
 
@@ -96,3 +108,69 @@ async def test_search_rejects_escape(workspace: Path) -> None:
     assert grep.is_error
     grep_glob = await _call(GrepTool(), workspace, pattern="x", glob="../*")
     assert grep_glob.is_error
+
+
+@pytest.mark.asyncio
+async def test_write_is_fenced_at_write_site(workspace: Path) -> None:
+    async def deny(_path: str) -> None:
+        raise ClaimError("claim lost before write")
+
+    result = await _call(
+        WriteFileTool(),
+        workspace,
+        assert_write_allowed=deny,
+        path="fenced.txt",
+        content="should not land",
+    )
+    assert result.is_error and result.error_kind == "claim_fenced"
+    assert not (workspace / "fenced.txt").exists()
+
+
+@pytest.mark.asyncio
+async def test_edit_is_fenced_at_write_site(workspace: Path) -> None:
+    async def deny(_path: str) -> None:
+        raise ClaimError("claim lost before write")
+
+    target = workspace / "fenced-edit.txt"
+    target.write_text("before", encoding="utf-8")
+    result = await _call(
+        EditFileTool(),
+        workspace,
+        assert_write_allowed=deny,
+        path="fenced-edit.txt",
+        old_string="before",
+        new_string="after",
+    )
+    assert result.is_error and result.error_kind == "claim_fenced"
+    assert target.read_text(encoding="utf-8") == "before"
+
+
+@pytest.mark.asyncio
+async def test_direct_write_requires_executor_authorization(workspace: Path) -> None:
+    result = await _call(
+        WriteFileTool(),
+        workspace,
+        approved=False,
+        path="unauthorized.txt",
+        content="nope",
+    )
+    assert result.is_error and result.error_kind == "approval_required"
+    assert not (workspace / "unauthorized.txt").exists()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="FIFOs are POSIX-only")
+@pytest.mark.asyncio
+async def test_read_fifo_is_rejected(workspace: Path) -> None:
+    fifo = workspace / "pipe"
+    os.mkfifo(fifo)
+    result = await _call(ReadFileTool(), workspace, path="pipe")
+    assert result.is_error and result.error_kind == "invalid_argument"
+
+
+@pytest.mark.asyncio
+async def test_grep_does_not_read_sensitive_files(workspace: Path) -> None:
+    (workspace / ".env").write_text("SECRET_TOKEN=leak", encoding="utf-8")
+    result = await _call(GrepTool(), workspace, pattern="SECRET_TOKEN")
+    assert not result.is_error
+    assert "leak" not in result.content
+    assert "no matches" in result.content

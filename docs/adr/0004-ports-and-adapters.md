@@ -1,41 +1,33 @@
-# ADR 0004: Ports and adapters; one composition root
+# ADR 0004：端口与适配器；单一组合根
 
-- Status: Accepted
-- Date: 2026-11-19
+- 状态：已采纳
+- 日期：2026-11-19
 
-## Context
+## 背景
 
-Agent runtimes tend to collapse into a single loop that knows the provider, the
-database, the UI and the tools. That makes testing and replacement expensive.
-The Phase 0 design explicitly requires decoupling the runtime from providers,
-tools and UI.
+Agent Runtime 很容易坍缩成一个同时了解 Provider、数据库、UI 和工具的巨型 Loop，导致测试与替换成本很高。阶段 0 设计明确要求 Runtime 与 Provider、工具、UI 解耦。
 
-## Decision
+## 决策
 
-Define ports in the kernel and implement them as adapters:
+在内核定义端口，并以外围适配器实现：
 
-- `ModelProvider` (providers/base.py)
-- `Tool` + `ToolRegistry` (tools/base.py)
-- `SessionService` + repositories (sessions, storage)
-- `Approver` (policy/approver.py)
-- `EventBus` (observability/bus.py)
-- `PathGuard` and `PermissionEngine` (policy)
+- `ModelProvider`（providers/base.py）
+- `Tool` + `ToolRegistry`（tools/base.py）
+- `SessionService` + Repository（sessions、storage）
+- `Approver`（policy/approver.py）
+- `EventBus`（observability/bus.py）
+- `PathGuard` 与 `PermissionEngine`（policy）
 
-`bootstrap.py` is the only composition root. `ui/` is an outer layer. The kernel
-does not import concrete adapters or Rich/Typer.
+`bootstrap.py` 是唯一组合根。`ui/` 是外层。内核不 import 具体适配器或 Rich/Typer。
 
-## Consequences
+## 影响
 
-- Tests use scripted providers and temporary SQLite without network or UI.
-- Adding a provider or a storage backend is localized.
-- More explicit wiring in `bootstrap.py`; accepted as the cost of clear
-  boundaries.
-- Dependency cycles are prevented with structural protocols (e.g.
-  `policy.engine.ToolLike`) rather than back-imports.
+- 测试使用脚本化 Provider 与临时 SQLite，不需要网络或 UI。
+- 新增 Provider 或存储后端时改动局部化。
+- `bootstrap.py` 的显式装配更多；这是清晰边界的成本。
+- 用结构化协议（如 `policy.engine.ToolLike`）防止依赖环，而不是反向 import。
 
-## Alternatives
+## 备选方案
 
-- Framework-managed DI container: unnecessary for this scale and hides the
-  object graph.
-- Direct imports inside the runtime: faster to write, impossible to test or
-  replace cleanly.
+- 框架管理的 DI 容器：当前规模没有必要，且隐藏对象图。
+- Runtime 内直接 import：写起来快，但无法干净测试或替换。

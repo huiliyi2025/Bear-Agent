@@ -6,11 +6,18 @@ This package deliberately has no dependency on storage, providers, tools or UI.
 from bear_agent.core.cancel import CancelToken, RunCancelled
 from bear_agent.core.clock import Clock, FakeClock, SystemClock
 from bear_agent.core.errors import (
+    ApprovalError,
+    AuditError,
     BearError,
+    ClaimConflict,
+    ClaimError,
     ConfigError,
     ContextOverflowError,
     PolicyError,
     ProviderError,
+    SandboxError,
+    SandboxUnavailable,
+    SecretStoreError,
     SessionLeaseError,
     StorageError,
     ToolExecutionError,
@@ -33,9 +40,13 @@ from bear_agent.core.tool_spec import ToolSpec
 from bear_agent.core.usage import TokenUsage, UsageSummary
 
 __all__ = [
+    "ApprovalError",
     "AssistantMessage",
+    "AuditError",
     "BearError",
     "CancelToken",
+    "ClaimConflict",
+    "ClaimError",
     "Clock",
     "ConfigError",
     "ContextOverflowError",
@@ -47,6 +58,9 @@ __all__ = [
     "PolicyError",
     "ProviderError",
     "RunCancelled",
+    "SandboxError",
+    "SandboxUnavailable",
+    "SecretStoreError",
     "SessionLeaseError",
     "StorageError",
     "SystemClock",

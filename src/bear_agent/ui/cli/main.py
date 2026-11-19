@@ -7,6 +7,7 @@ renderer, call the runtime. No agent logic lives in the CLI.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import platform
 import sys
@@ -19,6 +20,7 @@ from rich.panel import Panel
 from rich.table import Table
 
 from bear_agent import __version__
+from bear_agent.audit.service import AuditEntry, AuditService, AuditVerification
 from bear_agent.bootstrap import Container, build_container, permission_mode
 from bear_agent.config.loader import (
     default_config_path,
@@ -31,24 +33,46 @@ from bear_agent.core.errors import BearError
 from bear_agent.core.usage import TokenUsage
 from bear_agent.policy.approver import AutoApprover, DenyingApprover
 from bear_agent.runtime.stop_policy import RunStatus
+from bear_agent.secrets.redaction import SecretRedactor
+from bear_agent.secrets.store import SecretManager, secret_store_from_config
 from bear_agent.sessions.models import SessionRecord
 from bear_agent.sessions.service import SessionService
+from bear_agent.shell.sandbox.base import SandboxManager
 from bear_agent.storage.database import Database
+from bear_agent.storage.security_repositories import SecretNameRepository
 from bear_agent.tools.builtin import create_builtin_tools
 from bear_agent.ui.cli.approvals import CliApprover
 from bear_agent.ui.cli.render import Renderer
 
+
+def _configure_stdout_utf8() -> None:
+    """让 Typer/Rich 在 Windows 终端正确显示中文。"""
+    if sys.platform != "win32":
+        return
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        with contextlib.suppress(OSError, ValueError):
+            reconfigure(encoding="utf-8", errors="replace")
+
+
+_configure_stdout_utf8()
 console = Console()
 app = typer.Typer(
     add_completion=False,
     no_args_is_help=False,
     invoke_without_command=True,
-    help="Bear-Agent - a local-first, recoverable, extensible agent harness.",
+    help="Bear-Agent——本地优先、可恢复、可扩展的 Agent Harness。",
 )
-sessions_app = typer.Typer(help="Inspect and resume sessions.")
-config_app = typer.Typer(help="Inspect configuration.")
+sessions_app = typer.Typer(help="查看与恢复会话。")
+config_app = typer.Typer(help="查看配置。")
+audit_app = typer.Typer(help="查看安全审计链。")
+secret_app = typer.Typer(help="管理 keyring 密钥。")
 app.add_typer(sessions_app, name="sessions")
 app.add_typer(config_app, name="config")
+app.add_typer(audit_app, name="audit")
+app.add_typer(secret_app, name="secret")
 
 
 # --------------------------------------------------------------------- helpers
@@ -98,6 +122,7 @@ def _load(
 
 
 def _fail(message: str, *, code: int = 1) -> None:
+    message = SecretRedactor().redact(message)
     console.print(f"[red]error:[/red] {message}", highlight=False)
     raise typer.Exit(code=code)
 
@@ -196,7 +221,7 @@ def chat(
     ),
     yes: bool = typer.Option(False, "--yes", "-y", help="Auto-approve tool prompts."),
 ) -> None:
-    """Start an interactive session."""
+    """启动交互式会话。"""
     settings = _load(
         config=config,
         base_url=base_url,
@@ -240,6 +265,8 @@ async def _chat(
     except Exception as exc:
         _fail(f"failed to initialize Bear-Agent: {exc}", code=1)
         raise AssertionError("unreachable") from exc
+    with contextlib.suppress(Exception):
+        await container.secrets.hydrate_redactor()
     unsubscribe = container.bus.subscribe(Renderer(console=console))
     try:
         try:
@@ -342,7 +369,7 @@ def run(
     json_output: bool = typer.Option(False, "--json", help="Emit NDJSON events."),
     yes: bool = typer.Option(False, "--yes", "-y", help="Auto-approve tool prompts."),
 ) -> None:
-    """Run one task headlessly."""
+    """无头执行一个任务。"""
     settings = _load(
         config=config,
         base_url=base_url,
@@ -389,6 +416,8 @@ async def _run_once(
     except Exception as exc:
         _fail(f"failed to initialize Bear-Agent: {exc}", code=1)
         raise AssertionError("unreachable") from exc
+    with contextlib.suppress(Exception):
+        await container.secrets.hydrate_redactor()
     renderer = Renderer(json_mode=json_output, console=console)
     unsubscribe = container.bus.subscribe(renderer)
     try:
@@ -400,7 +429,7 @@ async def _run_once(
         try:
             result = await container.runtime.run(session.id, prompt)
         except BearError as exc:
-            console.print(f"[red]{type(exc).__name__}:[/red] {exc}")
+            console.print(f"[red]{type(exc).__name__}:[/red] {container.redactor.redact(str(exc))}")
             return 1
         renderer.summary(
             result.status.value,
@@ -409,7 +438,7 @@ async def _run_once(
             result.stop_reason,
         )
         if result.error:
-            console.print(f"[red]{result.error}[/red]")
+            console.print(f"[red]{container.redactor.redact(result.error)}[/red]")
         return 0 if result.status == RunStatus.COMPLETED else 1
     finally:
         unsubscribe()
@@ -424,7 +453,7 @@ def sessions_list(
     config: Path | None = typer.Option(None, "--config"),
     limit: int = typer.Option(20, "--limit", min=1, max=200),
 ) -> None:
-    """List recent sessions."""
+    """列出最近会话。"""
     settings = _load(
         config=config,
         base_url=None,
@@ -464,7 +493,7 @@ def sessions_show(
     config: Path | None = typer.Option(None, "--config"),
     messages: int = typer.Option(10, "--messages", min=1, max=100),
 ) -> None:
-    """Show a session transcript and usage."""
+    """查看会话转录与用量。"""
     settings = _load(
         config=config,
         base_url=None,
@@ -523,7 +552,7 @@ def config_show(
     config: Path | None = typer.Option(None, "--config"),
     as_json: bool = typer.Option(False, "--json"),
 ) -> None:
-    """Print effective configuration (secrets redacted)."""
+    """输出当前生效配置(密钥已脱敏)。"""
     settings = _load(
         config=config,
         base_url=None,
@@ -537,6 +566,9 @@ def config_show(
         data = settings.model_dump(mode="json")
         for provider in data.get("providers", {}).values():
             provider.pop("api_key", None)
+            provider.pop("headers", None)
+        # shell.env may contain user-supplied secrets; never print it.
+        data.get("shell", {}).pop("env", None)
         console.print_json(json.dumps(data, ensure_ascii=False))
     else:
         console.print(settings_to_toml(settings), markup=False)
@@ -544,7 +576,7 @@ def config_show(
 
 @config_app.command("path")
 def config_path() -> None:
-    """Print the default config path."""
+    """输出默认配置路径。"""
     console.print(str(default_config_path()))
 
 
@@ -556,7 +588,7 @@ def init(
     force: bool = typer.Option(False, "--force", help="Overwrite an existing config."),
     config: Path | None = typer.Option(None, "--config"),
 ) -> None:
-    """Create a starter configuration file."""
+    """创建初始配置文件。"""
     target = config or default_config_path()
     try:
         write_default_config(target, force=force)
@@ -571,7 +603,7 @@ def init(
 def doctor(
     config: Path | None = typer.Option(None, "--config"),
 ) -> None:
-    """Check configuration, storage and provider readiness."""
+    """检查配置、存储、Provider、Sandbox 与工具就绪状态。"""
     checks: list[tuple[str, str, str]] = []
     try:
         settings = load_settings(config)
@@ -596,18 +628,20 @@ def doctor(
         checks.append(("data-dir", "fail", str(exc)))
 
     try:
-        db = Database(settings.resolved_data_dir() / "bear.db")
-        try:
-            service = SessionService(db)
-            count = len(asyncio.run(service.list_recent(1)))
-            checks.append(("database", "ok", f"{count} recent session(s) readable"))
-        finally:
-            db.close()
+        count, verification = asyncio.run(_doctor_db_checks(settings))
+        checks.append(("database", "ok", f"{count} recent session(s) readable"))
+        if not settings.audit.enabled:
+            checks.append(("audit", "warn", "audit disabled by configuration"))
+        elif verification.ok:
+            checks.append(("audit", "ok", f"hash chain verified ({verification.records} records)"))
+        else:
+            checks.append(("audit", "fail", verification.reason))
     except Exception as exc:
         checks.append(("database", "fail", str(exc)))
 
+    secret_store = secret_store_from_config(settings.secrets.backend)
     try:
-        settings.validate_ready()
+        settings.validate_ready(secret_store=secret_store)
         provider = settings.provider()
         checks.append(
             ("provider", "ok", f"{settings.agent.default_provider} | {provider.base_url}")
@@ -615,15 +649,58 @@ def doctor(
     except Exception as exc:
         checks.append(("provider", "fail", str(exc)))
 
+    if secret_store.available():
+        checks.append(("secrets", "ok", f"{settings.secrets.backend} backend available"))
+    else:
+        checks.append(("secrets", "warn", "keyring unavailable; env/plain references still work"))
+
+    sandbox = SandboxManager(settings.sandbox, Path.cwd())
+    description = sandbox.describe()
+    try:
+        sandbox.ensure_available()
+        if settings.sandbox.mode == "off":
+            checks.append(("sandbox", "warn", "explicitly disabled; shell is not isolated"))
+        else:
+            checks.append(
+                (
+                    "sandbox",
+                    "ok",
+                    f"{description.get('backend')} mode={description.get('mode')} "
+                    f"capabilities={description.get('capabilities')}",
+                )
+            )
+    except Exception as exc:
+        checks.append(("sandbox", "warn", f"shell unavailable: {exc}"))
+
     try:
         tools = create_builtin_tools()
-        checks.append(("tools", "ok", f"{len(tools)} built-in tools"))
+        extra = " + shell" if settings.shell.enabled else ""
+        checks.append(("tools", "ok", f"{len(tools)} built-in tools{extra}"))
     except Exception as exc:
         checks.append(("tools", "fail", str(exc)))
+
+    checks.append(
+        (
+            "claims",
+            "ok" if settings.claims.enabled else "warn",
+            f"enabled={settings.claims.enabled} ttl={settings.claims.ttl_s:.0f}s",
+        )
+    )
 
     _print_checks(checks)
     if any(state == "fail" for _, state, _ in checks):
         raise typer.Exit(code=1)
+
+
+async def _doctor_db_checks(settings: Settings) -> tuple[int, Any]:
+    db = Database(settings.resolved_data_dir() / "bear.db")
+    try:
+        service = SessionService(db)
+        count = len(await service.list_recent(1))
+        verification = await AuditService(db, enabled=settings.audit.enabled).verify()
+        return count, verification
+    finally:
+        db.close()
 
 
 def _print_checks(checks: list[tuple[str, str, str]]) -> None:
@@ -632,9 +709,192 @@ def _print_checks(checks: list[tuple[str, str, str]]) -> None:
     table.add_column("state")
     table.add_column("detail")
     for name, state, detail in checks:
-        style = "green" if state == "ok" else "red"
+        style = {"ok": "green", "warn": "yellow"}.get(state, "red")
         table.add_row(name, f"[{style}]{state}[/{style}]", detail)
     console.print(table)
+
+
+# ---------------------------------------------------------------------- audit
+
+
+@audit_app.command("verify")
+def audit_verify(
+    config: Path | None = typer.Option(None, "--config"),
+) -> None:
+    """验证本地审计哈希链。"""
+    settings = _load(
+        config=config,
+        base_url=None,
+        api_key=None,
+        provider=None,
+        model=None,
+        permission=None,
+        max_turns=None,
+    )
+
+    async def _verify() -> AuditVerification:
+        db = Database(settings.resolved_data_dir() / "bear.db")
+        try:
+            return await AuditService(db, enabled=settings.audit.enabled).verify()
+        finally:
+            db.close()
+
+    verification = asyncio.run(_verify())
+    if verification.ok:
+        console.print(f"[green]audit chain OK[/green] ({verification.records} records)")
+        return
+    console.print(
+        f"[red]audit chain FAILED[/red] at id={verification.first_bad_id}: {verification.reason}"
+    )
+    raise typer.Exit(code=1)
+
+
+@audit_app.command("tail")
+def audit_tail(
+    config: Path | None = typer.Option(None, "--config"),
+    limit: int = typer.Option(20, "--limit", min=1, max=500),
+) -> None:
+    """显示最近的审计记录。"""
+    settings = _load(
+        config=config,
+        base_url=None,
+        api_key=None,
+        provider=None,
+        model=None,
+        permission=None,
+        max_turns=None,
+    )
+
+    async def _tail() -> list[AuditEntry]:
+        db = Database(settings.resolved_data_dir() / "bear.db")
+        try:
+            return await AuditService(db, enabled=settings.audit.enabled).tail(limit)
+        finally:
+            db.close()
+
+    entries = asyncio.run(_tail())
+    table = Table(title="Audit tail")
+    table.add_column("id", style="cyan")
+    table.add_column("time", style="dim")
+    table.add_column("actor")
+    table.add_column("action")
+    table.add_column("resource")
+    for entry in entries:
+        table.add_row(
+            str(entry.id),
+            entry.created_at.strftime("%Y-%m-%d %H:%M:%S"),
+            entry.actor,
+            entry.action,
+            entry.resource or "",
+        )
+    console.print(table)
+
+
+# --------------------------------------------------------------------- secrets
+
+
+async def _secret_manager(settings: Settings) -> tuple[Database, SecretManager]:
+    data_dir = settings.ensure_data_dirs()
+    db = Database(data_dir / "bear.db")
+    manager = SecretManager(
+        secret_store_from_config(settings.secrets.backend),
+        SecretNameRepository(db),
+        SecretRedactor(),
+    )
+    return db, manager
+
+
+@secret_app.command("set")
+def secret_set(
+    name: str = typer.Argument(..., help="Secret name, e.g. deepseek."),
+    config: Path | None = typer.Option(None, "--config"),
+) -> None:
+    """把密钥写入 OS keyring。"""
+    settings = _load(
+        config=config,
+        base_url=None,
+        api_key=None,
+        provider=None,
+        model=None,
+        permission=None,
+        max_turns=None,
+    )
+    value = typer.prompt("Secret value", hide_input=True, confirmation_prompt=True)
+
+    async def _set() -> None:
+        db, manager = await _secret_manager(settings)
+        try:
+            if not manager.available:
+                raise BearError("secret backend is unavailable")
+            await manager.set(name, value)
+        finally:
+            db.close()
+
+    try:
+        asyncio.run(_set())
+    except Exception as exc:
+        _fail(f"failed to store secret: {exc}", code=1)
+    console.print(f"stored secret [cyan]{name}[/cyan]")
+
+
+@secret_app.command("list")
+def secret_list(
+    config: Path | None = typer.Option(None, "--config"),
+) -> None:
+    """列出密钥名称(绝不显示值)。"""
+    settings = _load(
+        config=config,
+        base_url=None,
+        api_key=None,
+        provider=None,
+        model=None,
+        permission=None,
+        max_turns=None,
+    )
+
+    async def _list() -> list[str]:
+        db, manager = await _secret_manager(settings)
+        try:
+            return await manager.list_names()
+        finally:
+            db.close()
+
+    names = asyncio.run(_list())
+    if not names:
+        console.print("[dim]no secrets stored[/dim]")
+        return
+    for name in names:
+        console.print(f"  [cyan]{name}[/cyan]")
+
+
+@secret_app.command("delete")
+def secret_delete(
+    name: str = typer.Argument(..., help="Secret name."),
+    config: Path | None = typer.Option(None, "--config"),
+) -> None:
+    """从 OS keyring 删除密钥。"""
+    settings = _load(
+        config=config,
+        base_url=None,
+        api_key=None,
+        provider=None,
+        model=None,
+        permission=None,
+        max_turns=None,
+    )
+
+    async def _delete() -> None:
+        db, manager = await _secret_manager(settings)
+        try:
+            await manager.delete(name)
+        finally:
+            db.close()
+
+    try:
+        asyncio.run(_delete())
+    except Exception as exc:
+        _fail(f"failed to delete secret: {exc}", code=1)
+    console.print(f"deleted secret [cyan]{name}[/cyan]")
 
 
 # ---------------------------------------------------------------------- root
