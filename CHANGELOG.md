@@ -2,6 +2,38 @@
 
 记录所有重要变更。项目按阶段路线图推进；公开版本发布后使用语义化版本。
 
+## [0.6.0] — 2026-11-20 — 阶段 6：Observability / Trace / Metrics / Benchmark
+
+### 新增
+
+- Schema v6：`traces`、`spans`、`benchmark_runs`；事件继续使用已有 `span_id` 关联 Trace，不复制 EventBus/Audit/Model Call/Tool Call 事实。
+- TraceService：根 Trace/Span、父子关系、状态（running/ok/error/cancelled/incomplete）、ContextVar 异步传播、批量写入、错误隔离、脱敏与属性上限、导出、保留裁剪、崩溃后不完整识别。
+- Trace 接入 Session/Run/Turn/Task/Plan Revision/Model/Provider Retry/Fallback/Tool/MCP/Hook/Context Compression/Checkpoint/Recovery/Fork；`bear trace list/show/run/stats/export/prune`。
+- MetricsService：按时间窗口/Session 聚合 events、model_calls、tool_calls、tasks、attempts、plans、plan_revisions、compactions、context_anchors、checkpoints、traces。
+- Runtime/Task/Provider/Model/Tool/Context/Recovery/System 指标：成功率、P50/P95/P99、Token、缓存 Token、Usage 缺失、可配置价格成本估算、审批等待、权限拒绝、Sandbox、Hook、MCP 调用/配置、Plugin 配置、Circuit、Retry/Fallback、Fencing/Claim/未知工具状态；MCP/Plugin 生命周期历史明确标记不可用。
+- 进程内 Counter/Gauge/Histogram Registry 与 LiveMetricsCollector；标签键/值/序列数上限与 `_overflow` 折叠。
+- DiagnosticsService：结构化 PASS/WARN/FAIL/SKIP、静态/活动模式、配置/Schema/存储/SecretStore/Provider/MCP/Plugin/Hook/Sandbox/Audit/Checkpoint/Recovery/Trace/Metrics/Benchmark/保留策略/环境检查；`bear doctor --json --export --active --category`。
+- Benchmark Framework：Scenario Registry、Warmup、迭代、独立临时 workspace/data dir、Mean/Median/P50/P95/P99/Min/Max/Stdev、Throughput、Error Rate、Token、Cost、结构化结果、Run ID、历史、比较、JSON 导出。
+- 43 个内置 Benchmark 场景：Kernel、Tool、Context、Task、Provider、MCP、E2E；真实 stdio MCP、真实 Runtime/ToolExecutor/TaskEngine、Plugin Hook；真实 Provider 与 ScriptedProvider 分离。
+- CLI `bear bench list/run/report/history/compare/export/prune`、`bear metrics show/providers/tools/tasks/recovery/export`。
+- 配置 `[observability]`（采样、批量、保留、价格）与 `[benchmarks]`；`config_version`；`config show` 输出新配置。
+- 新增 ADR 0021（Trace/Metrics/Diagnostics 边界）与 ADR 0022（Benchmark Framework）。
+
+### 安全
+
+- Trace 不记录 Prompt、模型输出、工具参数/结果；导出事件移除 content/arguments/summary/evidence 等内容字段。
+- Trace/Metrics 写入或查询失败不影响 Run、Tool、Approval、Claim、Audit、Sandbox、Recovery 决策。
+- Diagnostics 默认只做静态检查；`--active` 才调用 Provider/启动 MCP，并明确标记。
+- Benchmark 不为提速降低安全设置；Sandbox/Shell 不可用即 SKIP；真实 Provider 需显式 `--allow-network`；结果脱敏。
+- 修复外部 Hook/MCP 安全 cwd 目录不存在导致 WinError 267 的问题；`ensure_data_dirs` 现在创建 `hooks`/`mcp` 安全目录。
+
+### 已知限制
+
+- Trace 属性由调用点约定；Metrics 查询为按需聚合（20 万事件行上限）。
+- 成本为配置估算，不是账单；Fencing 拒绝计数进程内。
+- Benchmark 是单机短样本；真实 Provider 受网络/模型版本/价格影响。
+- macOS Seatbelt 与真实第三方 Provider 未在本机验证；CI 多平台结果单独说明。
+
 ## [0.5.0] — 2026-11-20 — 阶段 5：Hooks / MCP / Plugins / Provider Fallback
 
 ### 新增

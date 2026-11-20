@@ -12,8 +12,8 @@
 | P3 | 上下文压缩 + Checkpoint + 恢复 | **已完成** |
 | P4 | 持久化 Task / Plan / Todo 引擎 | **已完成** |
 | P5 | Hooks、插件、MCP、Provider Fallback | **已完成** |
-| P6 | 可观测性、Trace、评估 | 下一阶段 |
-| P7 | TUI、打包、发布工程 | 计划中 |
+| P6 | 可观测性、Trace、Metrics、Diagnostics、Benchmark | **已完成** |
+| P7 | TUI、打包、发布工程 | 下一阶段 |
 | P8 | Server/Web UI、多会话、子代理 | 可选 |
 
 ---
@@ -59,7 +59,7 @@
 - 无上下文摘要、锚点账本、Checkpoint 文件（P3）。
 - 无 Task/Plan/Todo 引擎；Loop 仍以单次请求为中心（P4）。
 - 无 Hooks/MCP/插件（P5）。
-- 无 Trace UI / Eval 套件（P6）。
+- ~~无 Trace / Metrics / Benchmark~~——已在 P6 交付；全屏 Trace UI 与 Eval 套件仍属后续阶段。
 - TUI 是流式 CLI，不是全屏应用（P7）。
 - Provider 在流式模式下不返回 usage 时，用量可能为 0。
 
@@ -260,11 +260,39 @@
 - 真实外部 Provider 网络未在测试中验证；跨厂商差异需 adapter。
 - partial stream 只能失败并诊断，不能透明恢复。
 
-## P6——可观测性与评估
+## P6——可观测性、Trace、Metrics、Diagnostics 与 Benchmark（已完成）
 
-- Trace 服务与 CLI（`bear trace`、`stats`、`usage`、`replay`）。
-- 成本模型、按 Session/任务聚合、导出。
-- Benchmark 套件/运行器/报告；可复现 fixture。
+> 完成报告：[P6-COMPLETION-REPORT.md](P6-COMPLETION-REPORT.md)。
+
+### 已交付
+
+- Schema v6：`traces`、`spans`、`benchmark_runs`；事件通过已有 `span_id` 关联 Trace，不复制 EventBus/Audit/Model/Tool 事实。
+- TraceService：根 Trace/Span 生命周期、父子关系、错误/取消、上下文传播、批量写入、脱敏/截断、导出、保留/裁剪、不完整 Trace 识别。
+- Trace 接入 Runtime、Turn、Task/Plan、Model、Provider Attempt/Retry/Fallback、Tool、MCP、Hook、Compaction、Checkpoint、Recovery、Fork；`bear trace list/show/run/stats/export/prune`。
+- MetricsService：从 events/model_calls/tool_calls/tasks/attempts/plans/plan_revisions/compactions/checkpoints/traces 按时间窗口与会话聚合；Run/Task/Provider/Model/Tool/Context/Recovery/System 指标、P50/P95/P99、Token、可配置价格成本估算、导出。
+- 进程内 Counter/Gauge/Histogram Registry 与 EventBus LiveMetricsCollector；标签基数上限。
+- DiagnosticsService：结构化 PASS/WARN/FAIL/SKIP；静态检查与 `--active` 连通性检查分离；`bear doctor --json/--export/--active/--category`。
+- Benchmark Framework：场景 Registry、Warmup/迭代、精确统计、独立临时数据目录、结构化结果与 Schema v6 持久化、Run ID、历史、比较、JSON 导出。
+- 43 个内置场景，覆盖 Kernel/Tool/Context/Task/Provider/MCP/E2E；真实 stdio MCP Server、真实 Runtime/ToolExecutor/TaskEngine/Plugin Hook；真实 Provider 场景显式 `--allow-network`。
+- CLI `bear bench list/run/report/history/compare/export/prune`；`bear metrics show/providers/tools/tasks/recovery/export`。
+- 文档：ADR 0021/0022、P6 完成报告、ROADMAP/CHANGELOG/ARCHITECTURE/SECURITY/DEVELOPMENT/README。
+
+### 验收证据
+
+- 全量 pytest、ruff、format、mypy、build 通过（见 P6 Completion Report）。
+- 真实 Run 的 Trace 可从 `run_id` 还原 Span 树并关联事件；Task Plan 有独立 task spans；Provider fallback/hook 有 span。
+- Trace/Metrics 写入或查询失败不改变 Run、Tool、Approval、Claim、Audit、Recovery 的安全决策。
+- Benchmark 可重复运行、保存、历史查询与比较；真实/脚本化 Provider 分离。
+- 性能测试覆盖 Trace 写入、Metrics 查询、Observability 对 Runtime 的相对开销。
+
+### 已知限制
+
+- Trace 属性由调用点控制，必须持续遵守“只记录元数据”；导出会移除内容字段。
+- Metrics 每次按需聚合，长窗口/大数据量查询有成本；事件查询超过 20 万行标记下界。
+- 成本是配置价格估算，不是 Provider 账单。
+- Fencing 拒绝计数为进程内；重启重置。
+- Benchmark 是单机短样本，不代表生产吞吐或统计显著性；真实 Provider 结果受网络/模型版本/价格影响。
+- macOS Seatbelt 与真实第三方 Provider 未在本机验证；GitHub Actions 多平台结果见完成报告。
 
 ## P7——UX 与分发
 

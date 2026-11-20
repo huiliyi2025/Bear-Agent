@@ -1,6 +1,6 @@
 # 架构
 
-> 状态：阶段 5（Hooks / MCP / Plugins / Provider Fallback）。本文描述当前已经实现的能力，以及后续阶段必须遵守的边界。
+> 状态：阶段 6（Observability / Trace / Metrics / Diagnostics / Benchmark）。本文描述当前已经实现的能力，以及后续阶段必须遵守的边界。
 
 ## 目标
 
@@ -11,7 +11,7 @@ Bear-Agent 是本地优先的 Agent Harness，具备四项不可妥协的属性�
 3. **执行层安全**——权限与路径边界由代码强制执行，而不是依赖 Prompt 请求模型遵守。
 4. **可替换的边缘**——模型、存储、工具与 UI 都是端口/适配器。
 
-阶段 5 的非目标：托管多租户服务、分布式 Worker、图形化工作流编排器、模型训练。
+阶段 6 的非目标：托管多租户服务、分布式 Worker、图形化工作流编排器、模型训练。
 
 ## 分层
 
@@ -128,7 +128,9 @@ CLI / run 命令
 | `secrets` | keyring 存储、密钥引用、脱敏 | 持久化明文密钥 |
 | `audit` | 哈希链安全记录与验证 | 通用会话 Trace |
 | `sessions/claims` | 文件/树 Claim 租约与 fencing | 模型可见的 Tool API |
-| `observability` | 事件总线、记录器、持久化/瞬态事件策略 | 改变运行行为 |
+| `observability` | 事件总线、记录器、持久化/瞬态事件策略、Trace、Metrics、Live Registry | 改变运行行为或参与安全决策 |
+| `diagnostics` | 结构化静态/主动诊断、报告导出 | 默认执行外部命令/模型调用 |
+| `benchmarks` | 场景、Runner、统计、结果存储与比较 | 评估 Agent 输出质量 |
 | `ui/cli` | Typer 命令、Rich 渲染、审批提示 | Agent Loop 逻辑 |
 
 ## 消息模型
@@ -198,6 +200,9 @@ SQLite（WAL）是状态真源。截至阶段 3 的表：
 - `tasks`——Task 定义、状态、尝试计数、验收标准、结果。
 - `task_dependencies`——Task 依赖边。
 - `task_attempts`——每次执行的 attempt、完成请求/验证、错误与结果。
+- `traces`——根 Trace：session/run/task、状态、时间、属性、span 计数、不完整标记。
+- `spans`——Trace 内的父子 Span、状态、时间、属性与错误；事件通过已有 `events.span_id` 关联。
+- `benchmark_runs`——场景、kind、状态、环境/参数/样本/统计 JSON、应用版本与 Git commit。
 
 所有多行变更都使用显式 `BEGIN IMMEDIATE` 事务。消息行与其消息事件一起写入；工具调用行通过 Repository 事务更新。所有会话状态写入默认读取 ambient LeaseFence，并在同一事务中校验 owner/epoch/过期时间。
 
@@ -242,6 +247,16 @@ Plugin 是 Manifest 扩展包，可贡献 MCP Server、外部 Hook 和（显式�
 
 `FallbackProvider` 维护有序 Primary/Fallback 路由、每路由 RetryPolicy、能力与 Circuit Breaker。只有尚未产生任何流事件时才允许重试/切换；一旦输出文本、Thinking、Tool Call、Usage 或 Finish，失败以 `partial_stream` 结束，避免重复文本/工具副作用。实际 route 写入 ModelResponse/model_calls，并通过 `provider.*` 事件观察。
 
+## Trace / Metrics / Diagnostics / Benchmark
+
+Trace 是路径视图：一个 Trace 对应一次 Run/Plan Run，Span 覆盖 Turn、Task、Model Call、Provider Attempt/Retry/Fallback、Tool、MCP、Hook、Compaction、Checkpoint、Recovery、Fork。根 Trace 在操作开始时插入；Span 批量写入 `spans`。事件不复制，继续使用已有 `events.span_id`/`parent_span_id`；Trace 只保存计数、ID、状态与错误类别，不保存 Prompt、模型输出、工具参数/结果。属性经 Redactor 与字节上限处理，导出时进一步移除内容字段。Trace 写入失败被隔离，不影响 Run、Tool、Approval、Claim、Audit 或 Recovery。
+
+Metrics 不对事实做二次持久化：`MetricsService` 按时间窗口/Session 聚合 events、model_calls、tool_calls、tasks/task_attempts/plans/plan_revisions、compactions/context_anchors、checkpoints 与 traces，计算运行/任务/工具/模型延迟分布、Token、错误与成本估算。进程内 `MetricsRegistry` 提供 Counter/Gauge/Histogram 与 LiveMetricsCollector，用于实时 Surface/Benchmark，标签有基数上限。成本来自 `[observability.pricing]`，缺失价格会被报告而不是伪造。
+
+Diagnostics 输出结构化 Check，默认只读配置/文件/SQLite/Manifest/审计链/Checkpoint/Provider 配置/MCP 命令存在性等静态检查；`--active` 才发送最小 Provider 请求或启动 MCP Server。Trace/Metrics/Benchmark 存储、保留策略和 Recovery backlog 都纳入检查。
+
+Benchmark 的场景在 Registry 注册，`prepare` 不计时，`run` 计时，`cleanup` 不计时；每次迭代使用独立临时 workspace/data dir。Runner 执行 Warmup、多迭代与错误样本，输出 Mean/Median/P50/P95/P99/Min/Max/Stdev、Throughput、Error Rate、Token 与成本，保存到 `benchmark_runs`。真实 Provider 场景（`kind=real`）必须显式 `--allow-network`，与 ScriptedProvider 结果分离；`--trace` 会给计时增加开销并记录在 notes。
+
 ## Session Fork
 
 Fork 在单个事务中复制 `1..cut` 消息与活跃 anchors，创建新 Session ID，并记录 lineage。安全切点会回退到不完整 tool_call 之前。执行状态（tool_calls、model_calls、claims、approvals、processes、checkpoints、compactions）不继承；新会话必须重新获取 Lease/Claim 与审批。
@@ -275,6 +290,8 @@ ContextBuilder 保持 System Prompt 与项目指令稳定，并按用户回合�
 - 密钥脱敏与 keyring 密钥；keyring 不可用时 `secret://` 引用 fail-closed。
 - 哈希链审计日志与验证，覆盖策略、审批、Sandbox、Claim 与执行决策。
 - 文件/树 Claim 与 lease-owner fencing。
+- Trace/Metrics 是观察者：写入/查询失败不参与或改变安全决策；Trace 不保存 Prompt/工具参数/结果；导出进一步清洗事件内容。
+- Diagnostics 默认不执行外部命令/模型；`--active` 显式标记，Benchmark 在临时目录运行且不降低生产安全设置。
 
 仍推迟：MCP 信任、Prompt Injection 污点追踪、加密数据库、外部审计锚点、Windows 文件系统隔离。详见 `SECURITY.md`。
 

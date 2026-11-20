@@ -36,7 +36,7 @@ name = "Example MCP server"
 version = "0.1.0"                   # PEP 440
 description = "Optional"
 author = "Optional"
-requires_bear = ">=0.4.0,<0.6.0"    # optional PEP 440 specifier
+requires_bear = ">=0.4.0,<0.7.0"    # optional PEP 440 specifier
 homepage = "Optional"
 dependencies = ["other_plugin>=1.0"] # optional; resolved in dependency order
 enabled_by_default = false          # default is false

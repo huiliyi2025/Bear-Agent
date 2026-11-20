@@ -1,6 +1,6 @@
 [project]
 name = "bear-agent"
-version = "0.5.0"
+version = "0.6.0"
 description = "Bear-Agent——本地优先、可恢复、可扩展的 Agent Harness。"
 readme = "README.md"
 requires-python = ">=3.13"
@@ -61,6 +61,9 @@ ignore = ["E501"]
 "tests/*" = ["S101"]
 # Typer's CLI ergonomics require Option/Argument calls in argument defaults.
 "src/bear_agent/ui/cli/main.py" = ["B008"]
+# Scenario metadata dictionaries are read-only class constants defined once at
+# import time; instances never mutate them.
+"src/bear_agent/benchmarks/scenarios/*.py" = ["RUF012"]
 
 [tool.mypy]
 python_version = "3.13"

@@ -13,6 +13,7 @@ from bear_agent.core.errors import StorageError
 from bear_agent.core.events import PERSISTED_EVENT_TYPES, Event, EventType
 from bear_agent.core.fencing import LeaseFence
 from bear_agent.observability.bus import EventBus
+from bear_agent.observability.trace.context import current_span_ids
 from bear_agent.secrets.redaction import SecretRedactor
 from bear_agent.sessions.service import SessionService
 
@@ -53,12 +54,15 @@ class EventRecorder:
             if event is None:
                 raise StorageError(f"event type {event_type.value!r} is not persistable")
         else:
+            span_id, parent_span_id = current_span_ids()
             event = Event(
                 session_id=session_id,
                 type=event_type,
                 payload=safe_payload,
                 run_id=run_id,
                 turn_id=turn_id,
+                span_id=span_id,
+                parent_span_id=parent_span_id,
             )
         await self.bus.publish(event)
         return event

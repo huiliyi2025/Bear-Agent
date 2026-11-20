@@ -17,6 +17,9 @@ uv run ruff check src tests
 uv run ruff format --check src tests
 uv run mypy src
 uv run pytest
+uv run pytest --cov=bear_agent --cov-report=term-missing
+uv sync --frozen
+uv build
 ```
 
 运行单个测试：
@@ -49,7 +52,9 @@ src/bear_agent/
   artifacts/     内容寻址 artifact 存储与完整性校验
   context/       System Prompt、Token 估算、ContextBuilder、分层压缩、Anchor Ledger
   runtime/       AgentRuntime、TurnExecutor、ModelCaller、Summarizer、StopPolicy
-  observability/ EventBus、EventRecorder
+  observability/ EventBus、EventRecorder、trace/、metrics/
+  diagnostics/   结构化静态/主动诊断、报告模型
+  benchmarks/    Scenario Registry、Runner、统计、builtin scenarios、MCP fixture
   ui/cli/        Typer 命令、Rich 渲染器、CLI approver
   bootstrap.py   组合根（Container + Maintenance）
 tests/
@@ -163,6 +168,45 @@ bear secret list            # 只看名称，不显示值
 - Plugin 优先使用 Manifest 贡献 MCP/Hook；Python Plugin 需显式 `allow_python` + `permissions.python`，并说明无沙箱风险。
 - Provider 路由重试/切换只能在产生任何流事件之前；任何 partial stream 必须失败并保留诊断，禁止重放已输出 Tool Call。
 - 测试：`uv run pytest tests/unit/test_hooks.py tests/unit/test_mcp_tools.py tests/unit/test_plugins.py tests/unit/test_provider_router.py tests/integration/test_hooks_runtime.py tests/integration/test_mcp_runtime.py tests/integration/test_plugins_runtime.py tests/integration/test_provider_runtime_fallback.py -q`。
+
+## Trace / Metrics / Diagnostics / Benchmark
+
+新增可观测路径：
+
+1. 在核心操作内使用 `async with span("name", "kind", {...})`；没有 Trace 时自动 no-op。只放元数据：ID、计数、状态、Provider/Model、错误类别。绝不放 Prompt、工具参数、工具结果或用户内容。
+2. 跨 async 调用不需要手动传 Trace Context：ContextVar 会传播；子任务不串线。
+3. 需要新 Span Kind 时更新 `observability/trace/models.py` 的 `SpanKind` 与文档。
+4. Trace 写入失败必须保持观察者语义：不要因为 span 失败改变控制流或安全决策。
+
+新增指标：
+
+1. 优先从既有事件/领域表聚合到 `observability/metrics/query.py`；不要新建每样本表或复制事实。
+2. 实时表面使用 `MetricsRegistry`；Label 只放低基数枚举，Session/Run/Tool Call ID 只做行过滤。
+3. 成本需要 `[observability.pricing]`；缺失价格必须报告，不估算为 0。
+4. 新事件类型要同时更新 `metrics/query.py` 的事件白名单与测试。
+
+新增诊断：
+
+1. 在 `DiagnosticsService` 增加 Check；静态检查不得执行外部命令、模型或写业务状态。
+2. 主动检查必须 `mode=CheckMode.ACTIVE`，并只在 `--active` 运行。
+3. 错误文本经 `self._safe(...)`；metadata 不应含密钥。
+4. 测试 PASS/WARN/FAIL、JSON、过滤与脱敏。
+
+新增 Benchmark：
+
+1. 在 `benchmarks/scenarios/` 实现 Protocol：`prepare` 不计时、`run` 计时、`cleanup` 不计时。
+2. 每次迭代使用 `BenchmarkContext` 的独立 `workspace`/`data_dir`；不要写用户真实数据目录。
+3. 使用真实 Runtime/ToolExecutor/TaskEngine 进行 E2E；不允许为性能数字降低生产安全设置。能力不可用时抛 `BenchmarkSkipped`。
+4. 真实网络/Provider 场景设置 `kind="real"` 且 `requires_network=True`，只能在 `--allow-network` 下运行。
+5. 在 `benchmarks/scenarios/__init__.py` 注册；补充 Runner/统计/持久化/比较与 CLI 测试。
+
+性能测量：
+
+```bash
+uv run bear bench run kernel.trace_write --iterations 5 --warmup 2
+uv run bear bench run kernel.trace_write_disabled --iterations 5 --warmup 2
+uv run bear bench run e2e.single_tool --iterations 5 --warmup 2
+```
 
 ## 添加 Provider
 

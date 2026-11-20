@@ -25,6 +25,7 @@ from bear_agent.core.events import EventType
 from bear_agent.core.fencing import LeaseFence
 from bear_agent.core.ids import new_id
 from bear_agent.observability.recorder import EventRecorder
+from bear_agent.observability.trace import span
 from bear_agent.secrets.redaction import SecretRedactor
 from bear_agent.storage.database import Database, transaction
 from bear_agent.storage.repositories import assert_session_lease_row
@@ -414,6 +415,38 @@ class TaskService:
     # ----------------------------------------------------------------- revise
 
     async def revise_plan(
+        self,
+        session_id: str,
+        draft: PlanDraft,
+        *,
+        reason: str,
+        source: Literal["model", "user", "system"] = "model",
+        run_id: str | None = None,
+        fence: LeaseFence | None = None,
+    ) -> PlanRecord:
+        async with span(
+            "plan.revision",
+            "plan",
+            {
+                "session_id": session_id,
+                "run_id": run_id,
+                "source": source,
+                "draft_tasks": len(draft.tasks),
+            },
+        ) as revision_span:
+            plan = await self._revise_plan(
+                session_id,
+                draft,
+                reason=reason,
+                source=source,
+                run_id=run_id,
+                fence=fence,
+            )
+            if revision_span is not None:
+                revision_span.set_attributes({"plan_id": plan.id, "version": plan.version})
+            return plan
+
+    async def _revise_plan(
         self,
         session_id: str,
         draft: PlanDraft,

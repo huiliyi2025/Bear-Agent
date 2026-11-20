@@ -24,6 +24,7 @@ from bear_agent.core.messages import (
     UserMessage,
 )
 from bear_agent.core.usage import UsageSummary
+from bear_agent.observability.trace.context import current_span_ids
 from bear_agent.sessions.models import SessionRecord
 from bear_agent.storage.database import Database, transaction
 from bear_agent.storage.repositories import (
@@ -62,12 +63,15 @@ class SessionService:
         if title:
             session.title = title
         await self.sessions.create(session)
+        span_id, parent_span_id = current_span_ids()
         events = await self.events.append(
             session.id,
             [
                 Event(
                     session_id=session.id,
                     type=EventType.SESSION_CREATED,
+                    span_id=span_id,
+                    parent_span_id=parent_span_id,
                     ts=session.created_at,
                     payload={
                         "cwd": session.cwd,
@@ -118,11 +122,14 @@ class SessionService:
         fence: LeaseFence | None = None,
     ) -> tuple[int, Event]:
         fence = resolve_fence(fence)
+        span_id, parent_span_id = current_span_ids()
         event = Event(
             session_id=session_id,
             type=event_type,
             run_id=run_id,
             turn_id=turn_id,
+            span_id=span_id,
+            parent_span_id=parent_span_id,
             payload=payload or {},
             ts=self.clock.now(),
         )
@@ -309,6 +316,7 @@ class SessionService:
         turn_id: str | None = None,
         fence: LeaseFence | None = None,
     ) -> Event | None:
+        span_id, parent_span_id = current_span_ids()
         events = await self.events.append(
             session_id,
             [
@@ -317,6 +325,8 @@ class SessionService:
                     type=event_type,
                     run_id=run_id,
                     turn_id=turn_id,
+                    span_id=span_id,
+                    parent_span_id=parent_span_id,
                     payload=payload or {},
                     ts=self.clock.now(),
                 )

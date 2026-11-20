@@ -24,6 +24,7 @@ from bear_agent.core.usage import TokenUsage
 from bear_agent.hooks.events import HookEvent
 from bear_agent.hooks.manager import HookManager
 from bear_agent.observability.recorder import EventRecorder
+from bear_agent.observability.trace import span
 from bear_agent.providers.base import ModelRequest
 from bear_agent.runtime.model_caller import ModelCaller, ModelResponse
 from bear_agent.sessions.models import SessionRecord
@@ -87,6 +88,44 @@ class TurnExecutor:
         *,
         lease_epoch: int | None = None,
     ) -> TurnOutcome:
+        async with span(
+            "turn",
+            "turn",
+            {
+                "session_id": session.id,
+                "run_id": run_id,
+                "turn": turn_index,
+                "model": self.model,
+            },
+        ) as turn_span:
+            outcome = await self._execute(
+                session,
+                turn_index,
+                run_id,
+                lease_owner,
+                cancel,
+                lease_epoch=lease_epoch,
+            )
+            if turn_span is not None:
+                turn_span.set_attributes(
+                    {
+                        "tool_calls": len(outcome.tool_results),
+                        "finish_reason": outcome.response.finish_reason,
+                        "usage": outcome.usage.model_dump(),
+                    }
+                )
+            return outcome
+
+    async def _execute(
+        self,
+        session: SessionRecord,
+        turn_index: int,
+        run_id: str,
+        lease_owner: str,
+        cancel: CancelToken,
+        *,
+        lease_epoch: int | None = None,
+    ) -> TurnOutcome:
         turn_id = new_id("turn")
         await self.recorder.record(
             session.id,
@@ -99,16 +138,35 @@ class TurnExecutor:
         tools = self.registry.specs()
         compaction_info: dict[str, object] = {}
         if self.compactor is not None and lease_epoch is not None:
-            prepared = await self.compactor.prepare(
-                session,
-                messages,
-                tools,
-                turn_index=turn_index,
-                run_id=run_id,
-                turn_id=turn_id,
-                fence=LeaseFence(lease_owner, lease_epoch),
-                cancel=cancel,
-            )
+            async with span(
+                "context.compaction",
+                "context",
+                {
+                    "session_id": session.id,
+                    "run_id": run_id,
+                    "turn": turn_index,
+                    "messages": len(messages),
+                },
+            ) as compaction_span:
+                prepared = await self.compactor.prepare(
+                    session,
+                    messages,
+                    tools,
+                    turn_index=turn_index,
+                    run_id=run_id,
+                    turn_id=turn_id,
+                    fence=LeaseFence(lease_owner, lease_epoch),
+                    cancel=cancel,
+                )
+                if compaction_span is not None:
+                    compaction_span.set_attributes(
+                        {
+                            "compacted": prepared.compacted,
+                            "levels": prepared.levels,
+                            "compaction_ids": prepared.compaction_ids,
+                            "result_messages": len(prepared.messages),
+                        }
+                    )
             messages_for_context = prepared.messages
             system_extra = prepared.anchor_block
             compaction_info = {
@@ -221,40 +279,70 @@ class TurnExecutor:
                 payload={"text": delta},
             )
 
-        try:
-            response = await self.model_caller.call(
-                request,
-                cancel,
-                on_text_delta=on_text,
-                on_thinking_delta=on_thinking,
-            )
-        except ProviderError as exc:
-            with contextlib.suppress(Exception):
-                await self.sessions.model_calls.record(
-                    call_id=new_id("mc"),
-                    session_id=session.id,
-                    turn_id=turn_id,
-                    provider=self.provider_name,
-                    model=request.model,
-                    usage=TokenUsage(),
-                    latency_ms=0,
-                    status="failed",
+        async with span(
+            "model.call",
+            "model",
+            {
+                "session_id": session.id,
+                "run_id": run_id,
+                "turn_id": turn_id,
+                "provider": self.provider_name,
+                "model": request.model,
+                "messages": len(request.messages),
+                "tools": len(tools),
+                "stream": request.stream,
+                "estimated_tokens": built.estimated_tokens,
+            },
+        ) as model_span:
+            try:
+                response = await self.model_caller.call(
+                    request,
+                    cancel,
+                    on_text_delta=on_text,
+                    on_thinking_delta=on_thinking,
                 )
-            if self.hooks is not None:
-                with contextlib.suppress(Exception):
-                    await self.hooks.emit(
-                        HookEvent.MODEL_ERROR,
-                        session_id=session.id,
-                        run_id=run_id,
-                        turn_id=turn_id,
-                        payload={"model": request.model, "category": exc.category},
-                        fence=(
-                            LeaseFence(lease_owner, lease_epoch)
-                            if lease_epoch is not None
-                            else None
-                        ),
+            except ProviderError as exc:
+                if model_span is not None:
+                    model_span.set_attributes(
+                        {"error_category": exc.category, "retryable": exc.retryable}
                     )
-            raise
+                with contextlib.suppress(Exception):
+                    await self.sessions.model_calls.record(
+                        call_id=new_id("mc"),
+                        session_id=session.id,
+                        turn_id=turn_id,
+                        provider=self.provider_name,
+                        model=request.model,
+                        usage=TokenUsage(),
+                        latency_ms=0,
+                        status="failed",
+                    )
+                if self.hooks is not None:
+                    with contextlib.suppress(Exception):
+                        await self.hooks.emit(
+                            HookEvent.MODEL_ERROR,
+                            session_id=session.id,
+                            run_id=run_id,
+                            turn_id=turn_id,
+                            payload={"model": request.model, "category": exc.category},
+                            fence=(
+                                LeaseFence(lease_owner, lease_epoch)
+                                if lease_epoch is not None
+                                else None
+                            ),
+                        )
+                raise
+            if model_span is not None:
+                model_span.set_attributes(
+                    {
+                        "provider": response.provider_name or self.provider_name,
+                        "model": response.model or request.model,
+                        "finish_reason": response.finish_reason,
+                        "latency_ms": response.latency_ms,
+                        "usage": response.usage.model_dump(),
+                        "tool_calls": len(response.message.tool_calls()),
+                    }
+                )
         _, message_event = await self.sessions.append_assistant_message(
             session.id,
             response.message,

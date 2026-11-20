@@ -39,6 +39,7 @@ from bear_agent.mcp.client import (
     connect_server,
 )
 from bear_agent.mcp.tools import MCPTool
+from bear_agent.observability.trace import span
 from bear_agent.secrets.redaction import SecretRedactor
 from bear_agent.secrets.store import SecretStore
 from bear_agent.tools.registry import ToolRegistry
@@ -207,6 +208,47 @@ class MCPManager:
         Failures raise :class:`MCPToolError` (or :class:`MCPUnavailable` when
         the server is not connected). There is deliberately no retry.
         """
+        async with span(
+            "mcp.call",
+            "mcp",
+            {
+                "server": server_name,
+                "tool": tool_name,
+                "argument_keys": sorted(arguments.keys()) if isinstance(arguments, dict) else [],
+            },
+        ) as mcp_span:
+            try:
+                result = await self._call_tool(
+                    server_name,
+                    tool_name,
+                    arguments,
+                    timeout_s=timeout_s,
+                    cancel=cancel,
+                )
+            except Exception as exc:
+                if mcp_span is not None:
+                    mcp_span.set_attributes(
+                        {"error_type": type(exc).__name__, "error": self._safe_error(exc)}
+                    )
+                raise
+            if mcp_span is not None:
+                mcp_span.set_attributes(
+                    {
+                        "blocks": len(result.get("content") or []),
+                        "is_error": bool(result.get("is_error")),
+                    }
+                )
+            return result
+
+    async def _call_tool(
+        self,
+        server_name: str,
+        tool_name: str,
+        arguments: dict[str, Any],
+        *,
+        timeout_s: float | None = None,
+        cancel: CancelToken | None = None,
+    ) -> dict[str, Any]:
         server = self.config.servers.get(server_name)
         if server is None:
             raise MCPUnavailable(f"unknown MCP server: {server_name!r}")
@@ -267,6 +309,23 @@ class MCPManager:
     # ------------------------------------------------------------ internals
 
     async def _start_server(self, server_name: str, server: MCPServerConfig) -> MCPServerStatus:
+        async with span(
+            "mcp.start",
+            "mcp",
+            {
+                "server": server_name,
+                "transport": server.transport,
+                "required": server.required,
+            },
+        ) as mcp_span:
+            status = await self._start_server_inner(server_name, server)
+            if mcp_span is not None:
+                mcp_span.set_attributes({"state": status.state, "tools": len(status.tools)})
+            return status
+
+    async def _start_server_inner(
+        self, server_name: str, server: MCPServerConfig
+    ) -> MCPServerStatus:
         if not server.trusted:
             message = (
                 f"MCP server {server_name!r} is not trusted; set trusted=true only "

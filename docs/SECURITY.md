@@ -1,6 +1,6 @@
 # 安全
 
-> 阶段 5 范围。本文说明当前已经强制实施的控制，以及尚未实现的控制。
+> 阶段 6 范围。本文说明当前已经强制实施的控制，以及尚未实现的控制。
 > 不要把推迟项当作已实现。
 
 ## 威胁模型
@@ -12,13 +12,14 @@ Bear-Agent 假设模型可能出错、被操纵，甚至主动对抗：
 - 破坏性或不可逆的 Shell 命令；
 - 通过 Shell、解释器、包装器、管道或编码进行的间接执行；
 - 恶意 MCP Server 或插件（阶段 5）；
+- 通过 Trace/Metrics/诊断/导出泄露 Prompt、工具输出或密钥（阶段 6）；
 - 资源耗尽（轮次、Token、磁盘、进程、输出）；
 - 通过工具输出、日志、事件或审计记录泄露密钥；
 - 多个会话同时写同一文件或工作区。
 
 **信任边界是运行时，不是 Prompt。**
 
-## 已实施控制（阶段 5）
+## 已实施控制（阶段 6）
 
 ### 权限模式与审批
 
@@ -185,6 +186,18 @@ Bear-Agent 假设模型可能出错、被操纵，甚至主动对抗：
 - 实际使用的 provider/model 记录到 Model Call 和事件，避免追溯错误。
 - invalid_request 不重试/不切换；context_length 只切到更大 context 的 route。
 
+### Trace / Metrics / Diagnostics / Benchmark
+
+- Trace 是诊断观察者，不是安全记录，也不参与权限、审批、Claim、Fencing、审计或恢复决策。
+- Trace 默认只记录元数据（ID、状态、计数、Provider/Model、错误类别、Token），不记录 Prompt、模型输出、工具参数或工具结果。属性经 SecretRedactor 与总字节上限处理；导出时移除 `content_preview`、`arguments_preview`、`summary`、`evidence` 等内容字段。
+- Trace 写入失败被捕获并丢弃，不会失败 Run；Trace 表不参与授权。Trace 查询/导出按 Session/Run/Task/时间过滤，不提供跨用户隔离（本地单用户工具）。
+- Metrics 在查询时聚合已有权威事实，不新增 Metric Sample 表；不把 Session/Run/用户输入/任意工具参数作为 Label。查询有 20 万行上限；超限明确标记下界。
+- 成本估算来自用户配置的价格；缺失价格报告 `pricing_missing`，不编造。估算不是 Provider 账单。
+- Diagnostics 默认 `static`：只读配置、文件、SQLite、Manifest、审计链、Checkpoint、命令存在性。`--active` 显式执行一次最小 Provider 请求（可能计费）与 MCP Server 启动（执行 trusted 配置命令）；输出标记 `mode=active`。Doctor 不执行 Hook、不写任务状态、不降低安全设置。
+- Diagnostics 报告自由文本经 Redactor；不输出 API Key/Headers/Secret。
+- Benchmark 在独立临时 workspace/data dir 运行，不修改生产配置；Shell/Sandbox 能力不可用时 SKIP，绝不切换 `sandbox.mode=off` 提性能。真实 Provider 需显式 `--allow-network`；结果只保存计数/统计/参数快照，不保存 Prompt/模型输出/工具结果，参数经 Redactor。
+- 任何 Trace/Metrics/Benchmark 写入或查询失败不得绕过 Audit、Approval、Claim 或 Fencing；安全决策不读取这些表。
+
 ### 工具执行
 
 - 执行前进行 JSON Schema 校验；非法参数不会到达工具。
@@ -216,6 +229,17 @@ Hardening 后的残余风险：
 - 递归/glob Shell 读取仍比显式路径策略更宽；Windows process-only/off 模式不 mask 敏感工作区文件。
 - keyring set/get 通过后端选择/拒绝逻辑测试；当前测试环境没有写入用户真实 Credential Manager。
 - macOS Seatbelt profile/deny 规则有单元测试，但当前环境未验证实际执行。
+
+### 阶段 6 残余风险
+
+- Trace 属性由调用点约定；新增 instrumentation 必须继续只记录元数据，代码审查与导出清洗是防线。
+- Trace 数据保留在本地 SQLite；拥有数据库读写权限者可读取全部 Trace/事件元数据。无静态加密、无外部完整性锚点。
+- Metrics 查询为按需聚合，长窗口/大数据量可能较慢；事件行上限会导致下界统计。
+- Fencing 拒绝计数为进程内，重启重置；跨进程历史不可见。
+- 成本估算依赖用户配置与 Provider 语义差异（缓存计价、四舍五入）；不是账单。
+- Benchmark 为单机短样本，不代表生产负载；真实 Provider 结果受网络/模型版本/价格影响。
+- Diagnostics `--active` 会执行 trusted MCP 命令并发送计费请求，必须由用户显式选择。
+- macOS Seatbelt 与真实第三方 Provider 未在本机验证。
 
 ### 阶段 5 残余风险
 

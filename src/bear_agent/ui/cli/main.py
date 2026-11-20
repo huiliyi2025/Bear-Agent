@@ -10,8 +10,8 @@ import asyncio
 import contextlib
 import json
 import os
-import platform
 import sys
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, NoReturn
 
@@ -19,9 +19,16 @@ import typer
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
+from rich.tree import Tree
 
 from bear_agent import __version__
 from bear_agent.audit.service import AuditEntry, AuditService, AuditVerification
+from bear_agent.benchmarks import (
+    BenchmarkRunner,
+    BenchmarkSkipped,
+    build_registry,
+    parse_params,
+)
 from bear_agent.bootstrap import (
     Container,
     build_container,
@@ -38,10 +45,20 @@ from bear_agent.config.models import Settings
 from bear_agent.core.cancel import CancelToken
 from bear_agent.core.errors import BearError, CheckpointError, TaskStateError
 from bear_agent.core.fencing import LeaseFence, reset_fence, set_fence
+from bear_agent.core.jsonio import write_json
 from bear_agent.core.messages import SystemMessage, UserMessage
 from bear_agent.core.usage import TokenUsage
+from bear_agent.diagnostics import (
+    CheckMode,
+    CheckStatus,
+    DiagnosticCheck,
+    DiagnosticReport,
+    DiagnosticsService,
+)
 from bear_agent.hooks.manager import HookManager
 from bear_agent.mcp.manager import MCPManager
+from bear_agent.observability.metrics import MetricsService
+from bear_agent.observability.trace import TraceService
 from bear_agent.plugins.manager import PluginManager
 from bear_agent.policy.approver import AutoApprover, DenyingApprover
 from bear_agent.providers.base import ModelRequest
@@ -52,12 +69,11 @@ from bear_agent.secrets.redaction import SecretRedactor
 from bear_agent.secrets.store import SecretManager, secret_store_from_config
 from bear_agent.sessions.models import SessionRecord
 from bear_agent.sessions.service import SessionService
-from bear_agent.shell.sandbox.base import SandboxManager
 from bear_agent.storage.database import Database
+from bear_agent.storage.migrations import SCHEMA_VERSION
 from bear_agent.storage.security_repositories import SecretNameRepository
 from bear_agent.tasks.models import PlanDraft, TaskStatus
 from bear_agent.tasks.service import TaskService
-from bear_agent.tools.builtin import create_builtin_tools
 from bear_agent.tools.registry import ToolRegistry
 from bear_agent.ui.cli.approvals import CliApprover
 from bear_agent.ui.cli.render import Renderer
@@ -92,6 +108,9 @@ providers_app = typer.Typer(help="查看与测试模型 Provider / Fallback。")
 plugins_app = typer.Typer(help="管理 Plugin。")
 mcp_app = typer.Typer(help="查看 MCP Server 与工具。")
 hooks_app = typer.Typer(help="查看 Hook。")
+trace_app = typer.Typer(help="查看、查询与导出 Agent Trace。")
+metrics_app = typer.Typer(help="查看与导出运行指标。")
+bench_app = typer.Typer(help="运行、保存与比较 Benchmark。")
 app.add_typer(sessions_app, name="sessions")
 app.add_typer(tasks_app, name="tasks")
 app.add_typer(config_app, name="config")
@@ -101,6 +120,9 @@ app.add_typer(providers_app, name="providers")
 app.add_typer(plugins_app, name="plugins")
 app.add_typer(mcp_app, name="mcp")
 app.add_typer(hooks_app, name="hooks")
+app.add_typer(trace_app, name="trace")
+app.add_typer(metrics_app, name="metrics")
+app.add_typer(bench_app, name="bench")
 
 
 # --------------------------------------------------------------------- helpers
@@ -223,6 +245,7 @@ def _print_banner(settings: Settings, cwd: Path, session: SessionRecord) -> None
 HELP = """\
 /help                 show this help
 /tools                list registered tools
+/metrics              show live counters/histograms for this process
 /session              show current session id and status
 /permission <mode>    plan | supervised | auto | unrestricted
 /new                  start a new session
@@ -340,6 +363,22 @@ async def _chat(
                             f"  [cyan]{name}[/cyan] "
                             f"[dim]({tool.side_effect.value})[/dim] {tool.description}"
                         )
+                    continue
+                if text == "/metrics":
+                    snapshot = container.metrics_registry.snapshot()
+                    if not snapshot:
+                        console.print("[dim]no live metrics yet[/dim]")
+                        continue
+                    for name in sorted(snapshot):
+                        family = snapshot[name]
+                        total = 0.0
+                        if family["kind"] == "histogram":
+                            total = sum(
+                                int(item["histogram"]["count"]) for item in family["series"]
+                            )
+                        else:
+                            total = sum(float(item["value"]) for item in family["series"])
+                        console.print(f"  [cyan]{name}[/cyan] {total:g}")
                     continue
                 if text == "/session":
                     session = await container.sessions.get(session.id) or session
@@ -537,11 +576,19 @@ async def _chat(
                             console.print("usage: /fork [message_seq]")
                             continue
                     try:
-                        forked = await container.fork.fork(
-                            session.id,
-                            at_message_seq=at,
-                            checkpoints=container.checkpoints,
-                        )
+                        async with container.tracer.trace(
+                            "sessions.fork",
+                            kind="fork",
+                            session_id=session.id,
+                            attributes={"at_message_seq": at},
+                        ) as fork_scope:
+                            forked = await container.fork.fork(
+                                session.id,
+                                at_message_seq=at,
+                                checkpoints=container.checkpoints,
+                            )
+                            if fork_scope is not None:
+                                fork_scope.set_attribute("session_id", forked.session.id)
                     except BearError as exc:
                         console.print(f"[red]fork failed:[/red] {exc}")
                         continue
@@ -807,13 +854,24 @@ def sessions_fork(
     async def _fork() -> None:
         maintenance = build_maintenance(settings, cwd=Path.cwd())
         try:
-            result = await maintenance.fork.fork(
-                session_id,
-                at_message_seq=at,
-                checkpoint_id=checkpoint,
-                title=title,
-                checkpoints=maintenance.checkpoints,
-            )
+            async with maintenance.tracer.trace(
+                "sessions.fork",
+                kind="fork",
+                session_id=session_id,
+                attributes={
+                    "at_message_seq": at,
+                    "checkpoint_id": checkpoint,
+                },
+            ) as fork_scope:
+                result = await maintenance.fork.fork(
+                    session_id,
+                    at_message_seq=at,
+                    checkpoint_id=checkpoint,
+                    title=title,
+                    checkpoints=maintenance.checkpoints,
+                )
+                if fork_scope is not None:
+                    fork_scope.set_attribute("session_id", result.session.id)
             console.print(
                 f"forked [cyan]{result.session.id}[/cyan] "
                 f"from {session_id} at message {result.cut_message_seq}"
@@ -861,7 +919,22 @@ def sessions_recover(
             fence = LeaseFence(owner, epoch)
             token = set_fence(fence)
             try:
-                report = await maintenance.recovery.recover_if_needed(session_id, fence=fence)
+                async with maintenance.tracer.trace(
+                    "sessions.recover",
+                    kind="recovery",
+                    session_id=session_id,
+                    attributes={"owner": owner, "epoch": epoch},
+                ) as recovery_scope:
+                    report = await maintenance.recovery.recover_if_needed(session_id, fence=fence)
+                    if recovery_scope is not None:
+                        recovery_scope.set_attributes(
+                            {
+                                "recovered": report.recovered,
+                                "blocked": report.blocked,
+                                "running_tools": report.running_tools,
+                                "issues": len(report.issues),
+                            }
+                        )
             finally:
                 reset_fence(token)
                 with contextlib.suppress(Exception):
@@ -2048,6 +2121,938 @@ def hooks_list(
     console.print(table)
 
 
+# ------------------------------------------------------------------ trace/metrics/bench
+
+
+def _settings_only(config: Path | None) -> Settings:
+    return _load(
+        config=config,
+        base_url=None,
+        api_key=None,
+        provider=None,
+        model=None,
+        permission=None,
+        max_turns=None,
+    )
+
+
+def _parse_since(value: str | None, *, default_days: int = 7) -> datetime | None:
+    if value is None:
+        return datetime.now(UTC) - timedelta(days=default_days)
+    text = value.strip().lower()
+    if not text or text == "all":
+        return None
+    units = {"s": 1, "m": 60, "h": 3_600, "d": 86_400, "w": 604_800}
+    if text[-1:] in units and text[:-1].isdigit():
+        return datetime.now(UTC) - timedelta(seconds=int(text[:-1]) * units[text[-1]])
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        _fail(f"invalid time window {value!r}; use 30m, 24h, 7d, 4w or ISO-8601", code=2)
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+
+
+def _trace_service(settings: Settings, db: Database) -> TraceService:
+    return TraceService(
+        db,
+        config=settings.observability,
+        redactor=SecretRedactor(),
+    )
+
+
+@trace_app.command("list")
+def trace_list(
+    config: Path | None = typer.Option(None, "--config"),
+    session: str | None = typer.Option(None, "--session", help="Filter by session id."),
+    run: str | None = typer.Option(None, "--run", help="Filter by run id."),
+    status: str | None = typer.Option(
+        None, "--status", help="running|ok|error|cancelled|incomplete"
+    ),
+    since: str = typer.Option("7d", "--since", help="Time window (24h, 7d, ISO-8601, all)."),
+    limit: int = typer.Option(20, "--limit", min=1, max=500),
+    as_json: bool = typer.Option(False, "--json"),
+) -> None:
+    """列出最近的 Trace。"""
+    settings = _settings_only(config)
+    since_dt = _parse_since(since)
+
+    async def _list() -> list[dict[str, Any]]:
+        db = Database(settings.resolved_data_dir() / "bear.db")
+        try:
+            return await _trace_service(settings, db).list_traces(
+                session_id=session,
+                run_id=run,
+                status=status,
+                since=since_dt,
+                limit=limit,
+            )
+        finally:
+            db.close()
+
+    rows = asyncio.run(_list())
+    if as_json:
+        console.print_json(json.dumps(rows, ensure_ascii=False, default=str))
+        return
+    if not rows:
+        console.print("[dim]no traces in this window[/dim]")
+        return
+    table = Table(title="Traces")
+    table.add_column("trace", style="cyan", no_wrap=True)
+    table.add_column("started", style="dim")
+    table.add_column("kind")
+    table.add_column("status")
+    table.add_column("duration")
+    table.add_column("spans", justify="right")
+    table.add_column("session")
+    table.add_column("run")
+    for row in rows:
+        color = _status_color(str(row["status"]))
+        table.add_row(
+            _short(row["trace_id"]),
+            str(row["started_at"])[:19],
+            str(row["kind"]),
+            f"[{color}]{row['status']}[/{color}]",
+            f"{row['duration_ms'] or 0} ms",
+            str(row["span_count"]),
+            _short(row["session_id"]),
+            _short(row["run_id"] or ""),
+        )
+    console.print(table)
+
+
+@trace_app.command("show")
+def trace_show(
+    trace_id: str = typer.Argument(..., help="Trace id."),
+    config: Path | None = typer.Option(None, "--config"),
+    as_json: bool = typer.Option(False, "--json"),
+    events: bool = typer.Option(False, "--events", help="Also show linked event types."),
+) -> None:
+    """显示一次执行的 Span 树与关键路径。"""
+    settings = _settings_only(config)
+
+    async def _show() -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
+        db = Database(settings.resolved_data_dir() / "bear.db")
+        try:
+            service = _trace_service(settings, db)
+            detail = await service.hierarchy(trace_id)
+            linked = await service.events(trace_id) if events else []
+            return detail, linked
+        finally:
+            db.close()
+
+    detail, linked = asyncio.run(_show())
+    if detail is None:
+        _fail(f"trace not found: {trace_id}", code=2)
+    if as_json:
+        console.print_json(json.dumps({"detail": detail, "events": linked}, ensure_ascii=False))
+        return
+    trace = detail["trace"]
+    color = _status_color(str(trace["status"]))
+    tree = Tree(
+        f"[bold]{trace['name']}[/bold] [dim]{trace['trace_id']}[/dim] "
+        f"[{color}]{trace['status']}[/{color}] {trace['duration_ms']} ms"
+    )
+    for root in detail["roots"]:
+        _render_span(root, tree)
+    console.print(tree)
+    if trace.get("error_message"):
+        console.print(f"[red]{trace['error_message']}[/red]")
+    if linked:
+        table = Table(title="Linked events")
+        table.add_column("seq", justify="right")
+        table.add_column("type")
+        table.add_column("span", style="dim")
+        for event in linked:
+            table.add_row(str(event["seq"]), str(event["type"]), _short(event.get("span_id") or ""))
+        console.print(table)
+
+
+@trace_app.command("run")
+def trace_run(
+    run_id: str = typer.Argument(..., help="Run id."),
+    config: Path | None = typer.Option(None, "--config"),
+    as_json: bool = typer.Option(False, "--json"),
+) -> None:
+    """按 Run ID 还原执行路径。"""
+    settings = _settings_only(config)
+
+    async def _find() -> list[dict[str, Any]]:
+        db = Database(settings.resolved_data_dir() / "bear.db")
+        try:
+            return await _trace_service(settings, db).find_by_run(run_id)
+        finally:
+            db.close()
+
+    rows = asyncio.run(_find())
+    if not rows:
+        _fail(f"no trace for run: {run_id}", code=2)
+    if as_json:
+        console.print_json(json.dumps(rows, ensure_ascii=False, default=str))
+        return
+    trace_show(rows[0]["trace_id"], config=config, as_json=False, events=False)
+
+
+@trace_app.command("export")
+def trace_export(
+    output: Path = typer.Option(..., "--output", "-o", help="Destination JSON file."),
+    config: Path | None = typer.Option(None, "--config"),
+    trace_id: str | None = typer.Option(None, "--trace", help="Explicit trace id."),
+    run: str | None = typer.Option(None, "--run", help="Latest trace for a run id."),
+    session: str | None = typer.Option(None, "--session", help="Latest trace for a session id."),
+) -> None:
+    """导出一个 Trace (含脱敏事件), 用于离线诊断。"""
+    settings = _settings_only(config)
+
+    async def _export() -> dict[str, Any] | None:
+        db = Database(settings.resolved_data_dir() / "bear.db")
+        try:
+            service = _trace_service(settings, db)
+            selected = trace_id
+            if selected is None and run is not None:
+                rows = await service.find_by_run(run)
+                selected = rows[0]["trace_id"] if rows else None
+            if selected is None and session is not None:
+                rows = await service.find_by_session(session, limit=1)
+                selected = rows[0]["trace_id"] if rows else None
+            if selected is None:
+                return None
+            return await service.export(selected)
+        finally:
+            db.close()
+
+    document = asyncio.run(_export())
+    if document is None:
+        _fail("no trace selected; pass --trace, --run or --session", code=2)
+    write_json(output, document)
+    console.print(f"trace exported to [cyan]{output}[/cyan]")
+
+
+@trace_app.command("stats")
+def trace_stats(
+    config: Path | None = typer.Option(None, "--config"),
+    as_json: bool = typer.Option(False, "--json"),
+) -> None:
+    """显示 Trace 存储计数与不完整 Trace。"""
+    settings = _settings_only(config)
+
+    async def _stats() -> dict[str, Any]:
+        db = Database(settings.resolved_data_dir() / "bear.db")
+        try:
+            return await _trace_service(settings, db).stats()
+        finally:
+            db.close()
+
+    stats = asyncio.run(_stats())
+    if as_json:
+        console.print_json(json.dumps(stats, ensure_ascii=False))
+        return
+    for key, value in stats.items():
+        console.print(f"{key:12s} {value}")
+
+
+@trace_app.command("prune")
+def trace_prune(
+    config: Path | None = typer.Option(None, "--config"),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Confirm deletion."),
+) -> None:
+    """按保留策略删除旧 Trace。"""
+    if not yes:
+        _fail("refusing to delete traces without --yes", code=2)
+    settings = _settings_only(config)
+
+    async def _prune() -> int:
+        db = Database(settings.resolved_data_dir() / "bear.db")
+        try:
+            return await _trace_service(settings, db).prune()
+        finally:
+            db.close()
+
+    console.print(f"deleted {asyncio.run(_prune())} trace(s)")
+
+
+def _render_span(span_node: dict[str, Any], tree: Tree) -> None:
+    color = _status_color(str(span_node["status"]))
+    attrs = span_node.get("attributes") or {}
+    interesting = [
+        f"{key}={attrs[key]}"
+        for key in (
+            "provider",
+            "model",
+            "tool",
+            "tool_call_id",
+            "hook_id",
+            "level",
+            "outcome",
+            "task_key",
+            "checkpoint_id",
+            "server",
+            "error_kind",
+        )
+        if key in attrs
+    ]
+    label = (
+        f"[{color}]{span_node['status']}[/{color}] "
+        f"[bold]{span_node['kind']}[/bold] {span_node['name']} "
+        f"[dim]{span_node['duration_ms']} ms[/dim]"
+    )
+    if interesting:
+        label += " [dim]" + " ".join(interesting) + "[/dim]"
+    branch = tree.add(label)
+    for child in span_node.get("children") or []:
+        _render_span(child, branch)
+
+
+def _status_color(status: str) -> str:
+    return {
+        "ok": "green",
+        "completed": "green",
+        "error": "red",
+        "failed": "red",
+        "cancelled": "yellow",
+        "incomplete": "yellow",
+        "running": "cyan",
+    }.get(status, "white")
+
+
+def _short(value: str, length: int = 14) -> str:
+    return value if len(value) <= length else value[: length - 1] + "…"
+
+
+# ---------------------------------------------------------------------- metrics
+
+
+@metrics_app.command("show")
+def metrics_show(
+    config: Path | None = typer.Option(None, "--config"),
+    since: str = typer.Option("7d", "--since"),
+    session: str | None = typer.Option(None, "--session"),
+    section: str = typer.Option(
+        "all", "--section", help="all|runs|tasks|models|tools|context|recovery|system"
+    ),
+    as_json: bool = typer.Option(False, "--json"),
+    export: Path | None = typer.Option(None, "--export"),
+) -> None:
+    """聚合 Runtime、Task、Provider、Tool、Context 与 Recovery 指标。"""
+    settings = _settings_only(config)
+    since_dt = _parse_since(since)
+    report = _metrics_report(settings, since_dt, session)
+    if export is not None:
+        write_json(export, report)
+        if not as_json:
+            console.print(f"metrics exported to [cyan]{export}[/cyan]")
+    if as_json:
+        console.print_json(json.dumps(report, ensure_ascii=False))
+        return
+    known_sections = {"runs", "tasks", "models", "tools", "context", "recovery", "system"}
+    if section != "all" and section not in known_sections:
+        _fail(
+            f"unknown metrics section {section!r}; choose all or {sorted(known_sections)}", code=2
+        )
+    sections = (
+        ["runs", "tasks", "models", "tools", "context", "recovery", "system"]
+        if section == "all"
+        else [section]
+    )
+    for name in sections:
+        _render_metric_section(name, report)
+    for note in report.get("notes") or []:
+        console.print(f"[dim]note: {note}[/dim]")
+
+
+def _metrics_report(
+    settings: Settings, since: datetime | None, session: str | None
+) -> dict[str, Any]:
+    if not settings.observability.enabled or not settings.observability.metrics_enabled:
+        _fail("metrics are disabled by [observability] configuration", code=2)
+
+    async def _report() -> dict[str, Any]:
+        db = Database(settings.resolved_data_dir() / "bear.db")
+        try:
+            return await MetricsService(
+                db, config=settings.observability, settings=settings
+            ).report(since=since, session_id=session)
+        finally:
+            db.close()
+
+    return asyncio.run(_report())
+
+
+def _render_metric_section(name: str, report: dict[str, Any]) -> None:
+    if name == "runs":
+        runs = report["runs"]
+        table = Table(title="Runs")
+        for key in ("total", "success_rate", "completed", "failed", "cancelled"):
+            table.add_column(key)
+        table.add_row(
+            str(runs["total"]),
+            f"{runs['success_rate']:.2%}",
+            str(runs["completed"]),
+            str(runs["failed"]),
+            str(runs["cancelled"]),
+        )
+        console.print(table)
+        _render_distribution("Run latency", runs["duration_ms"], suffix="ms")
+    elif name == "tasks":
+        tasks = report["tasks"]
+        table = Table(title="Tasks")
+        for key in ("total", "success_rate", "completed", "failed", "blocked", "retries"):
+            table.add_column(key)
+        table.add_row(
+            str(tasks["total"]),
+            f"{tasks['success_rate']:.2%}",
+            str(tasks["completed"]),
+            str(tasks["failed"]),
+            str(tasks["blocked"]),
+            str(tasks["retries"]),
+        )
+        console.print(table)
+        console.print(
+            f"[dim]plan revisions: {tasks['plan_revisions']}; attempts: {tasks['attempts']}[/dim]"
+        )
+        _render_distribution("Task latency", tasks["duration_ms"], suffix="ms")
+    elif name == "models":
+        models = report["models"]
+        console.print(
+            f"[bold]Model calls[/bold] calls={models['calls']} "
+            f"success={models['success_rate']:.2%} retries={models['retries']} "
+            f"fallbacks={models['fallbacks']} circuits={models['circuit_opens']}"
+        )
+        console.print(
+            f"[dim]tokens in={models['input_tokens']} out={models['output_tokens']} "
+            f"cache_read={models['cache_read_tokens']} "
+            f"usage_missing={models['usage_missing']} "
+            f"pricing_missing={models['pricing_missing']} "
+            f"cost={models['cost_by_currency']}[/dim]"
+        )
+        _render_distribution("Model latency", models["latency_ms"], suffix="ms")
+        if models["by_provider"]:
+            table = Table(title="Provider / model")
+            for key in ("provider", "model", "calls", "failures", "tokens", "cost"):
+                table.add_column(key)
+            for item in models["by_provider"]:
+                table.add_row(
+                    item["provider"],
+                    item["model"],
+                    str(item["calls"]),
+                    str(item["failures"]),
+                    str(item["input_tokens"] + item["output_tokens"]),
+                    f"{item['cost']} {item['currency'] or ''}".strip(),
+                )
+            console.print(table)
+    elif name == "tools":
+        tools = report["tools"]
+        console.print(
+            f"[bold]Tool calls[/bold] calls={tools['calls']} "
+            f"success={tools['success_rate']:.2%} timeouts={tools['timeouts']} "
+            f"cancelled={tools['cancelled']} unknown={tools['unknown']}"
+        )
+        console.print(
+            f"[dim]permission={tools['permission']} approvals={tools['approvals']} "
+            f"sandbox={tools['sandbox']['runs']} "
+            f"mcp={tools['mcp']['calls']} hooks={tools['hooks']['status_counts']}[/dim]"
+        )
+        _render_distribution("Tool latency", tools["duration_ms"], suffix="ms")
+        if tools["by_tool"]:
+            table = Table(title="Tool breakdown")
+            for key in ("tool", "calls", "success", "mean_ms", "p95"):
+                table.add_column(key)
+            for item in tools["by_tool"][:20]:
+                table.add_row(
+                    item["name"],
+                    str(item["calls"]),
+                    f"{item['success_rate']:.2%}",
+                    str(item["mean_ms"]),
+                    str(item["duration_ms"]["p95"]),
+                )
+            console.print(table)
+    elif name == "context":
+        context = report["context"]
+        table = Table(title="Context")
+        for key in ("builds", "compactions", "saved_tokens", "artifacts", "failures", "levels"):
+            table.add_column(key)
+        table.add_row(
+            str(context["builds"]),
+            str(context["compactions"]),
+            str(context["saved_tokens"]),
+            str(context["artifacts"]),
+            str(context["failures"]),
+            str(context["levels"]),
+        )
+        console.print(table)
+        console.print(
+            f"[dim]anchors active={context['anchors']['active']} "
+            f"added={context['anchors']['added']} removed={context['anchors']['removed']}[/dim]"
+        )
+    elif name == "recovery":
+        recovery = report["recovery"]
+        interesting = {
+            key: value for key, value in recovery.items() if isinstance(value, (int, float, str))
+        }
+        table = Table(title="Recovery / checkpoint")
+        table.add_column("metric")
+        table.add_column("value")
+        for key, value in interesting.items():
+            table.add_row(key, str(value))
+        console.print(table)
+    elif name == "system":
+        system = report["system"]
+        table = Table(title="System")
+        table.add_column("metric")
+        table.add_column("value")
+        for key in (
+            "platform",
+            "python",
+            "database_bytes",
+            "wal_bytes",
+            "process_memory_bytes",
+            "cpu_time_s",
+            "sessions",
+            "running_tools",
+            "active_claims",
+            "traces",
+            "benchmarks",
+        ):
+            table.add_row(key, str(system.get(key)))
+        console.print(table)
+
+
+def _render_distribution(title: str, distribution: dict[str, Any], *, suffix: str) -> None:
+    if not distribution.get("count"):
+        console.print(f"[dim]{title}: no samples[/dim]")
+        return
+    console.print(
+        f"[bold]{title}[/bold] n={distribution['count']} "
+        f"mean={distribution['mean']}{suffix} "
+        f"p50={distribution['p50']}{suffix} "
+        f"p95={distribution['p95']}{suffix} "
+        f"p99={distribution['p99']}{suffix} "
+        f"max={distribution['max']}{suffix}"
+    )
+
+
+@metrics_app.command("providers")
+def metrics_providers(
+    config: Path | None = typer.Option(None, "--config"),
+    since: str = typer.Option("7d", "--since"),
+    session: str | None = typer.Option(None, "--session"),
+    as_json: bool = typer.Option(False, "--json"),
+) -> None:
+    """Provider 统计。"""
+    report = _metrics_report(_settings_only(config), _parse_since(since), session)
+    if as_json:
+        console.print_json(json.dumps(report["models"], ensure_ascii=False))
+    else:
+        _render_metric_section("models", report)
+
+
+@metrics_app.command("tools")
+def metrics_tools(
+    config: Path | None = typer.Option(None, "--config"),
+    since: str = typer.Option("7d", "--since"),
+    session: str | None = typer.Option(None, "--session"),
+    as_json: bool = typer.Option(False, "--json"),
+) -> None:
+    """Tool 统计。"""
+    report = _metrics_report(_settings_only(config), _parse_since(since), session)
+    if as_json:
+        console.print_json(json.dumps(report["tools"], ensure_ascii=False))
+    else:
+        _render_metric_section("tools", report)
+
+
+@metrics_app.command("tasks")
+def metrics_tasks(
+    config: Path | None = typer.Option(None, "--config"),
+    since: str = typer.Option("7d", "--since"),
+    session: str | None = typer.Option(None, "--session"),
+    as_json: bool = typer.Option(False, "--json"),
+) -> None:
+    """Task 统计。"""
+    report = _metrics_report(_settings_only(config), _parse_since(since), session)
+    if as_json:
+        console.print_json(json.dumps(report["tasks"], ensure_ascii=False))
+    else:
+        _render_metric_section("tasks", report)
+
+
+@metrics_app.command("recovery")
+def metrics_recovery(
+    config: Path | None = typer.Option(None, "--config"),
+    since: str = typer.Option("7d", "--since"),
+    session: str | None = typer.Option(None, "--session"),
+    as_json: bool = typer.Option(False, "--json"),
+) -> None:
+    """Recovery 与 Checkpoint 统计。"""
+    report = _metrics_report(_settings_only(config), _parse_since(since), session)
+    if as_json:
+        console.print_json(json.dumps(report["recovery"], ensure_ascii=False))
+    else:
+        _render_metric_section("recovery", report)
+
+
+@metrics_app.command("export")
+def metrics_export(
+    output: Path = typer.Option(..., "--output", "-o"),
+    config: Path | None = typer.Option(None, "--config"),
+    since: str = typer.Option("7d", "--since"),
+    session: str | None = typer.Option(None, "--session"),
+) -> None:
+    """导出完整 Metrics 报告为 JSON。"""
+    report = _metrics_report(_settings_only(config), _parse_since(since), session)
+    write_json(output, report)
+    console.print(f"metrics exported to [cyan]{output}[/cyan]")
+
+
+# -------------------------------------------------------------------- benchmark
+
+
+@bench_app.command("list")
+def bench_list(
+    category: str | None = typer.Option(None, "--category"),
+    as_json: bool = typer.Option(False, "--json"),
+) -> None:
+    """列出内置 Benchmark 场景。"""
+    registry = build_registry()
+    scenarios = registry.list(category=category)
+    if as_json:
+        console.print_json(json.dumps([item.to_dict() for item in scenarios], ensure_ascii=False))
+        return
+    table = Table(title="Benchmark scenarios")
+    table.add_column("id", style="cyan")
+    table.add_column("category")
+    table.add_column("kind")
+    table.add_column("network")
+    table.add_column("description")
+    for item in scenarios:
+        table.add_row(
+            item.id,
+            item.category,
+            item.kind,
+            "yes" if item.requires_network else "no",
+            item.description,
+        )
+    console.print(table)
+
+
+@bench_app.command("run")
+def bench_run(
+    scenario: str | None = typer.Argument(None, help="Scenario id; omit with --all or --category."),
+    config: Path | None = typer.Option(None, "--config"),
+    cwd: Path | None = typer.Option(None, "--cwd", "-C"),
+    all_scenarios: bool = typer.Option(False, "--all", help="Run every scenario."),
+    category: str | None = typer.Option(
+        None, "--category", help="Run every scenario in a category."
+    ),
+    iterations: int | None = typer.Option(None, "--iterations", min=1),
+    warmup: int | None = typer.Option(None, "--warmup", min=0),
+    param: list[str] = typer.Option(
+        [], "--param", help="Scenario parameter key=value (repeatable)."
+    ),
+    trace: bool = typer.Option(False, "--trace", help="Trace each iteration (adds overhead)."),
+    save: bool = typer.Option(
+        True, "--save/--no-save", help="Persist results for history/compare."
+    ),
+    allow_network: bool = typer.Option(False, "--allow-network", help="Allow real provider calls."),
+    as_json: bool = typer.Option(False, "--json"),
+    output: Path | None = typer.Option(None, "--output", "-o"),
+) -> None:
+    """运行一个或多个 Benchmark 并保存结构化结果。"""
+    settings = _settings_only(config)
+    registry = build_registry()
+    if all_scenarios or category:
+        selected = [item.id for item in registry.list(category=category)]
+        if iterations is None:
+            iterations = 1
+    elif scenario:
+        selected = [scenario]
+    else:
+        _fail("specify a scenario, --all or --category", code=2)
+    if not selected:
+        _fail("the selected category contains no benchmark scenarios", code=2)
+    try:
+        for scenario_id in selected:
+            registry.get(scenario_id)
+    except KeyError as exc:
+        _fail(str(exc), code=2)
+    try:
+        params = parse_params(param)
+    except ValueError as exc:
+        _fail(str(exc), code=2)
+    workspace = _resolve_cwd(cwd)
+    data_dir = settings.ensure_data_dirs() if save else settings.resolved_data_dir()
+    db = Database(data_dir / "bear.db") if save else None
+    results: list[dict[str, Any]] = []
+    try:
+        runner = BenchmarkRunner(settings, registry=registry, cwd=workspace, db=db)
+        for scenario_id in selected:
+            try:
+                result = asyncio.run(
+                    runner.run(
+                        scenario_id,
+                        iterations=iterations,
+                        warmup=warmup,
+                        params=params,
+                        trace=trace,
+                        save=save,
+                        allow_network=allow_network,
+                    )
+                )
+            except BenchmarkSkipped as exc:
+                if as_json:
+                    results.append(
+                        {
+                            "scenario": {"id": scenario_id},
+                            "status": "skipped",
+                            "skip_reason": str(exc),
+                            "samples": [],
+                            "stats": {},
+                        }
+                    )
+                else:
+                    console.print(f"[yellow]{scenario_id}: skipped: {exc}[/yellow]")
+                continue
+            results.append(result)
+            if not as_json:
+                _print_benchmark_result(result)
+    finally:
+        if db is not None:
+            db.close()
+    if output is not None:
+        write_json(output, {"schema_version": 1, "results": results})
+        if not as_json:
+            console.print(f"benchmark results written to [cyan]{output}[/cyan]")
+    if as_json:
+        console.print_json(json.dumps(results, ensure_ascii=False, default=str))
+    if any(result["status"] == "failed" for result in results):
+        raise typer.Exit(code=1)
+
+
+def _print_benchmark_result(result: dict[str, Any]) -> None:
+    stats = result["stats"]
+    duration = stats["duration_ms"]
+    color = _status_color("ok" if result["status"] == "completed" else result["status"])
+    console.print(
+        f"[{color}]{result['scenario']['id']}[/{color}] {result['status']} "
+        f"n={stats['successful']}/{stats['iterations']} "
+        f"mean={duration['mean']}ms p50={duration['p50']}ms "
+        f"p95={duration['p95']}ms p99={duration['p99']}ms "
+        f"throughput={stats['throughput_per_s']}/s "
+        f"errors={stats['error_rate']:.2%} tokens={stats['tokens']} "
+        f"cost={stats['cost']}"
+    )
+    if result.get("skip_reason"):
+        console.print(f"[yellow]skip: {result['skip_reason']}[/yellow]")
+
+
+@bench_app.command("report")
+def bench_report(
+    run_id: str | None = typer.Argument(None, help="Benchmark run id; omit for the latest."),
+    config: Path | None = typer.Option(None, "--config"),
+    scenario: str | None = typer.Option(None, "--scenario"),
+    as_json: bool = typer.Option(False, "--json"),
+    samples: bool = typer.Option(False, "--samples", help="Include per-iteration samples."),
+    output: Path | None = typer.Option(None, "--output", "-o"),
+) -> None:
+    """查看已保存的 Benchmark 结果。"""
+    settings = _settings_only(config)
+
+    async def _get() -> dict[str, Any] | None:
+        db = Database(settings.resolved_data_dir() / "bear.db")
+        try:
+            runner = BenchmarkRunner(settings, registry=build_registry(), cwd=Path.cwd(), db=db)
+            if run_id:
+                return await runner.get(run_id)
+            rows = await runner.history(scenario_id=scenario, limit=1)
+            return rows[0] if rows else None
+        finally:
+            db.close()
+
+    record = asyncio.run(_get())
+    if record is None:
+        _fail("benchmark run not found", code=2)
+    document = dict(record["result"])
+    if not samples:
+        document.pop("samples", None)
+    if output is not None:
+        write_json(output, document)
+        if not as_json:
+            console.print(f"benchmark report written to [cyan]{output}[/cyan]")
+    if as_json:
+        console.print_json(json.dumps(document, ensure_ascii=False, default=str))
+        return
+    console.print(
+        Panel(
+            f"run      {record['run_id']}\n"
+            f"scenario {record['scenario_id']}\n"
+            f"status   {record['status']}\n"
+            f"kind     {record['kind']}\n"
+            f"started  {record['started_at']}\n"
+            f"git      {record['git_commit'] or '(unknown)'}\n"
+            f"app      {record['app_version']}",
+            title="Benchmark run",
+        )
+    )
+    _print_benchmark_result(record["result"])
+    if samples:
+        table = Table(title="Samples")
+        table.add_column("#", justify="right")
+        table.add_column("status")
+        table.add_column("duration_ms", justify="right")
+        table.add_column("tokens", justify="right")
+        table.add_column("error")
+        for sample in record["result"].get("samples") or []:
+            table.add_row(
+                str(sample["iteration"]),
+                sample["status"],
+                str(sample["duration_ms"]),
+                str(sample.get("tokens", 0)),
+                sample.get("error", ""),
+            )
+        console.print(table)
+
+
+@bench_app.command("history")
+def bench_history(
+    config: Path | None = typer.Option(None, "--config"),
+    scenario: str | None = typer.Option(None, "--scenario"),
+    limit: int = typer.Option(20, "--limit", min=1, max=200),
+    as_json: bool = typer.Option(False, "--json"),
+) -> None:
+    """列出历史 Benchmark 运行。"""
+    settings = _settings_only(config)
+
+    async def _history() -> list[dict[str, Any]]:
+        db = Database(settings.resolved_data_dir() / "bear.db")
+        try:
+            runner = BenchmarkRunner(settings, registry=build_registry(), cwd=Path.cwd(), db=db)
+            return await runner.history(scenario_id=scenario, limit=limit)
+        finally:
+            db.close()
+
+    rows = asyncio.run(_history())
+    if as_json:
+        console.print_json(json.dumps(rows, ensure_ascii=False, default=str))
+        return
+    table = Table(title="Benchmark history")
+    table.add_column("run", style="cyan")
+    table.add_column("scenario")
+    table.add_column("kind")
+    table.add_column("status")
+    table.add_column("started", style="dim")
+    table.add_column("mean_ms", justify="right")
+    table.add_column("p95_ms", justify="right")
+    for row in rows:
+        stats = row["result"]["stats"]
+        table.add_row(
+            row["run_id"][:18],
+            row["scenario_id"],
+            row["kind"],
+            row["status"],
+            row["started_at"][:19],
+            str(stats["duration_ms"]["mean"]),
+            str(stats["duration_ms"]["p95"]),
+        )
+    console.print(table)
+
+
+@bench_app.command("compare")
+def bench_compare(
+    run_a: str = typer.Argument(..., help="Baseline run id."),
+    run_b: str = typer.Argument(..., help="Candidate run id."),
+    config: Path | None = typer.Option(None, "--config"),
+    threshold: float | None = typer.Option(None, "--threshold", help="Regression threshold %."),
+    as_json: bool = typer.Option(False, "--json"),
+) -> None:
+    """比较同一场景的两次 Benchmark。"""
+    settings = _settings_only(config)
+
+    async def _compare() -> dict[str, Any]:
+        db = Database(settings.resolved_data_dir() / "bear.db")
+        try:
+            runner = BenchmarkRunner(settings, registry=build_registry(), cwd=Path.cwd(), db=db)
+            return await runner.compare(run_a, run_b, threshold_pct=threshold)
+        finally:
+            db.close()
+
+    try:
+        comparison = asyncio.run(_compare())
+    except ValueError as exc:
+        _fail(str(exc), code=2)
+    if as_json:
+        console.print_json(json.dumps(comparison, ensure_ascii=False, default=str))
+        return
+    console.print(f"verdict: [bold]{comparison['verdict']}[/bold]")
+    table = Table(title="Benchmark comparison")
+    table.add_column("metric")
+    table.add_column("before", justify="right")
+    table.add_column("after", justify="right")
+    table.add_column("delta", justify="right")
+    table.add_column("verdict")
+    for name, metric in comparison["metrics"].items():
+        color = {
+            "regression": "red",
+            "improvement": "green",
+            "stable": "dim",
+        }[metric["verdict"]]
+        table.add_row(
+            name,
+            str(metric["before"]),
+            str(metric["after"]),
+            f"{metric['delta_pct']:+.2f}%",
+            f"[{color}]{metric['verdict']}[/{color}]",
+        )
+    console.print(table)
+    if not comparison["compatible_environment"]:
+        console.print(
+            "[yellow]environment differs between runs; treat the comparison as indicative[/yellow]"
+        )
+
+
+@bench_app.command("prune")
+def bench_prune(
+    config: Path | None = typer.Option(None, "--config"),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Confirm deletion."),
+) -> None:
+    """按 [benchmarks] 保留策略删除旧结果。"""
+    if not yes:
+        _fail("refusing to delete benchmark results without --yes", code=2)
+    settings = _settings_only(config)
+
+    async def _prune() -> int:
+        db = Database(settings.resolved_data_dir() / "bear.db")
+        try:
+            runner = BenchmarkRunner(settings, registry=build_registry(), cwd=Path.cwd(), db=db)
+            return await runner.prune()
+        finally:
+            db.close()
+
+    console.print(f"deleted {asyncio.run(_prune())} benchmark run(s)")
+
+
+@bench_app.command("export")
+def bench_export(
+    run_id: str = typer.Argument(...),
+    output: Path = typer.Option(..., "--output", "-o"),
+    config: Path | None = typer.Option(None, "--config"),
+) -> None:
+    """导出一次 Benchmark 的完整结果。"""
+    settings = _settings_only(config)
+
+    async def _get() -> dict[str, Any] | None:
+        db = Database(settings.resolved_data_dir() / "bear.db")
+        try:
+            runner = BenchmarkRunner(settings, registry=build_registry(), cwd=Path.cwd(), db=db)
+            return await runner.get(run_id)
+        finally:
+            db.close()
+
+    record = asyncio.run(_get())
+    if record is None:
+        _fail(f"benchmark run not found: {run_id}", code=2)
+    write_json(output, record)
+    console.print(f"benchmark exported to [cyan]{output}[/cyan]")
+
+
 # ----------------------------------------------------------------------- admin
 
 
@@ -2070,193 +3075,103 @@ def init(
 @app.command()
 def doctor(
     config: Path | None = typer.Option(None, "--config"),
+    cwd: Path | None = typer.Option(None, "--cwd", "-C", help="Workspace directory."),
+    as_json: bool = typer.Option(False, "--json", help="Emit a structured JSON report."),
+    export: Path | None = typer.Option(None, "--export", help="Write the report to a JSON file."),
+    active: bool = typer.Option(
+        False,
+        "--active",
+        help="Run bounded connectivity checks (small provider request, MCP startup).",
+    ),
+    category: str | None = typer.Option(
+        None, "--category", help="Only show checks in these comma-separated categories."
+    ),
 ) -> None:
-    """检查配置、存储、Provider、Sandbox 与工具就绪状态。"""
-    checks: list[tuple[str, str, str]] = []
+    """统一诊断配置、存储、Provider、MCP、Plugin、Sandbox 与可观测性。"""
+    config_path = config or default_config_path()
     try:
         settings = load_settings(config)
-        checks.append(("config", "ok", "loaded"))
-    except BearError as exc:
-        checks.append(("config", "fail", str(exc)))
-        _print_checks(checks)
-        raise typer.Exit(code=1) from None
     except Exception as exc:
-        checks.append(("config", "fail", str(exc)))
-        _print_checks(checks)
-        raise typer.Exit(code=1) from None
-
-    checks.append(("python", "ok", platform.python_version()))
-    try:
-        data_dir = settings.ensure_data_dirs()
-        probe = data_dir / ".write-probe"
-        probe.write_text("ok", encoding="utf-8")
-        probe.unlink()
-        checks.append(("data-dir", "ok", str(data_dir)))
-    except OSError as exc:
-        checks.append(("data-dir", "fail", str(exc)))
-
-    try:
-        count, verification = asyncio.run(_doctor_db_checks(settings))
-        checks.append(("database", "ok", f"{count} recent session(s) readable"))
-        if not settings.audit.enabled:
-            checks.append(("audit", "warn", "audit disabled by configuration"))
-        elif verification.ok:
-            checks.append(("audit", "ok", f"hash chain verified ({verification.records} records)"))
-        else:
-            checks.append(("audit", "fail", verification.reason))
-    except Exception as exc:
-        checks.append(("database", "fail", str(exc)))
-
-    secret_store = secret_store_from_config(settings.secrets.backend)
-    try:
-        settings.validate_ready(secret_store=secret_store)
-        provider = settings.provider()
-        checks.append(
-            ("provider", "ok", f"{settings.agent.default_provider} | {provider.base_url}")
-        )
-    except Exception as exc:
-        checks.append(("provider", "fail", str(exc)))
-    try:
-        router = build_fallback_provider(settings, secret_store=secret_store)
-        try:
-            checks.append(
-                (
-                    "fallback",
-                    "ok" if not router.configuration_errors else "warn",
-                    f"{len(router.routes)} route(s)"
-                    + (
-                        f", {len(router.configuration_errors)} skipped"
-                        if router.configuration_errors
-                        else ""
-                    ),
+        report = DiagnosticReport(
+            app_version=__version__,
+            schema_version=SCHEMA_VERSION,
+            generated_at=datetime.now(UTC),
+            checks=[
+                DiagnosticCheck(
+                    id="config.load",
+                    category="config",
+                    status=CheckStatus.FAIL,
+                    summary="configuration could not be loaded",
+                    detail=SecretRedactor().redact(str(exc))[:1_000],
+                    mode=CheckMode.STATIC,
                 )
-            )
-        finally:
-            asyncio.run(router.aclose())
-    except Exception as exc:
-        checks.append(("fallback", "warn", str(exc)))
-    checks.append(
-        (
-            "hooks",
-            "ok" if settings.hooks.enabled else "warn",
-            f"{len(settings.hooks.commands)} command hook(s), "
-            f"external={'on' if settings.hooks.allow_external else 'off'}",
+            ],
+            config_path=str(config_path),
         )
-    )
-    checks.append(
-        (
-            "mcp",
-            "ok" if settings.mcp.enabled else "warn",
-            f"{len(settings.mcp.servers)} server(s); run `bear mcp status` to connect",
-        )
+        _emit_diagnostics(report, as_json=as_json, export=export)
+        raise typer.Exit(code=1) from None
+    workspace = _resolve_cwd(cwd)
+    categories = (
+        {item.strip() for item in category.split(",") if item.strip()} if category else None
     )
     try:
-        plugin_manager = PluginManager(
-            settings.plugins,
-            data_dir=settings.ensure_data_dirs(),
-            hooks_allow_external=settings.hooks.allow_external,
-            hooks_enabled=settings.hooks.enabled,
-        )
-        plugin_report = plugin_manager.validate_all()
-        checks.append(
-            (
-                "plugins",
-                "ok" if plugin_report.ok else "fail",
-                f"{len(plugin_report.plugins)} discovered; "
-                f"{sum(1 for item in plugin_report.plugins if item.ok)} valid",
-            )
+        report = asyncio.run(
+            DiagnosticsService(
+                settings,
+                cwd=workspace,
+                config_path=config_path,
+            ).run(active=active, categories=categories)
         )
     except Exception as exc:
-        checks.append(("plugins", "warn", str(exc)))
-
-    if secret_store.available():
-        checks.append(("secrets", "ok", f"{settings.secrets.backend} backend available"))
-    else:
-        checks.append(("secrets", "warn", "keyring unavailable; env/plain references still work"))
-
-    sandbox = SandboxManager(settings.sandbox, Path.cwd())
-    description = sandbox.describe()
-    try:
-        sandbox.ensure_available()
-        if settings.sandbox.mode == "off":
-            checks.append(("sandbox", "warn", "explicitly disabled; shell is not isolated"))
-        else:
-            checks.append(
-                (
-                    "sandbox",
-                    "ok",
-                    f"{description.get('backend')} mode={description.get('mode')} "
-                    f"capabilities={description.get('capabilities')}",
-                )
-            )
-    except Exception as exc:
-        checks.append(("sandbox", "warn", f"shell unavailable: {exc}"))
-
-    try:
-        tools = create_builtin_tools()
-        extra = " + shell" if settings.shell.enabled else ""
-        checks.append(("tools", "ok", f"{len(tools)} built-in tools{extra}"))
-    except Exception as exc:
-        checks.append(("tools", "fail", str(exc)))
-
-    checks.append(
-        (
-            "claims",
-            "ok" if settings.claims.enabled else "warn",
-            f"enabled={settings.claims.enabled} ttl={settings.claims.ttl_s:.0f}s",
-        )
-    )
-    checks.append(
-        (
-            "context",
-            "ok" if settings.context.compaction_enabled else "warn",
-            f"compaction={settings.context.compaction_enabled} "
-            f"trigger={settings.context.trigger_ratio} l3={settings.context.l3_enabled}",
-        )
-    )
-    checks.append(
-        (
-            "checkpoints",
-            "ok" if settings.checkpoints.enabled else "warn",
-            f"enabled={settings.checkpoints.enabled} "
-            f"every={settings.checkpoints.interval_turns} keep={settings.checkpoints.keep}",
-        )
-    )
-    checks.append(
-        (
-            "recovery",
-            "ok" if settings.recovery.enabled else "warn",
-            f"enabled={settings.recovery.enabled} "
-            f"kill_orphans={settings.recovery.kill_orphan_processes} "
-            f"require_audit={settings.recovery.require_audit}",
-        )
-    )
-
-    _print_checks(checks)
-    if any(state == "fail" for _, state, _ in checks):
-        raise typer.Exit(code=1)
+        _fail(f"diagnostics failed: {exc}", code=1)
+    _emit_diagnostics(report, as_json=as_json, export=export)
+    raise typer.Exit(code=report.exit_code)
 
 
-async def _doctor_db_checks(settings: Settings) -> tuple[int, Any]:
-    db = Database(settings.resolved_data_dir() / "bear.db")
-    try:
-        service = SessionService(db)
-        count = len(await service.list_recent(1))
-        verification = await AuditService(db, enabled=settings.audit.enabled).verify()
-        return count, verification
-    finally:
-        db.close()
-
-
-def _print_checks(checks: list[tuple[str, str, str]]) -> None:
+def _emit_diagnostics(
+    report: DiagnosticReport,
+    *,
+    as_json: bool,
+    export: Path | None,
+) -> None:
+    payload = report.to_dict()
+    if export is not None:
+        write_json(export, payload)
+        if not as_json:
+            console.print(f"report written to [cyan]{export}[/cyan]")
+    if as_json:
+        console.print_json(json.dumps(payload, ensure_ascii=False))
+        return
     table = Table(title="bear doctor")
-    table.add_column("check", style="cyan")
+    table.add_column("check", style="cyan", no_wrap=True)
     table.add_column("state")
+    table.add_column("mode", style="dim")
     table.add_column("detail")
-    for name, state, detail in checks:
-        style = {"ok": "green", "warn": "yellow"}.get(state, "red")
-        table.add_row(name, f"[{style}]{state}[/{style}]", detail)
+    colors = {
+        CheckStatus.PASS: "green",
+        CheckStatus.WARN: "yellow",
+        CheckStatus.FAIL: "red",
+        CheckStatus.SKIP: "dim",
+    }
+    for check in report.checks:
+        color = colors[check.status]
+        detail = check.summary
+        if check.detail:
+            detail += f" — {check.detail}"
+        table.add_row(
+            check.id,
+            f"[{color}]{check.status.value}[/{color}]",
+            check.mode.value,
+            detail,
+        )
     console.print(table)
+    counts = report.counts
+    console.print(
+        f"[dim]{counts['pass']} pass, {counts['warn']} warn, "
+        f"{counts['fail']} fail, {counts['skip']} skip[/dim]"
+    )
+    if not report.ok:
+        raise typer.Exit(code=1)
 
 
 # ---------------------------------------------------------------------- audit

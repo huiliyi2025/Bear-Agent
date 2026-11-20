@@ -266,7 +266,7 @@ def test_manifest_valid_and_helpers(tmp_path: Path) -> None:
         root,
         "demo",
         version="1.2.3",
-        requires_bear=">=0.4.0,<0.6.0",
+        requires_bear=">=0.4.0,<0.7.0",
         dependencies=["base>=1.0"],
         permissions=["hooks"],
         hooks=[

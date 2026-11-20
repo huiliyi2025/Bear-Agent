@@ -35,6 +35,7 @@ from bear_agent.core.messages import ToolCall
 from bear_agent.core.modes import PermissionMode
 from bear_agent.hooks.manager import HookManager
 from bear_agent.observability.recorder import EventRecorder
+from bear_agent.observability.trace import span
 from bear_agent.policy.approvals import ApprovalService, approval_fingerprint
 from bear_agent.policy.engine import PermissionEngine
 from bear_agent.policy.models import (
@@ -84,6 +85,52 @@ class ToolExecutor:
         self.max_output_chars = max_output_chars
 
     async def execute(
+        self,
+        call: ToolCall,
+        *,
+        session_id: str,
+        project_id: str | None,
+        lease_owner: str,
+        run_id: str | None,
+        turn_id: str | None,
+        cancel: CancelToken,
+        lease_epoch: int | None = None,
+    ) -> ToolResult:
+        async with span(
+            "tool.call",
+            "tool",
+            {
+                "session_id": session_id,
+                "run_id": run_id,
+                "turn_id": turn_id,
+                "tool_call_id": call.id,
+                "tool": call.name,
+            },
+        ) as tool_span:
+            result = await self._execute(
+                call,
+                session_id=session_id,
+                project_id=project_id,
+                lease_owner=lease_owner,
+                run_id=run_id,
+                turn_id=turn_id,
+                cancel=cancel,
+                lease_epoch=lease_epoch,
+            )
+            if tool_span is not None:
+                tool_span.set_attributes(
+                    {
+                        "is_error": result.is_error,
+                        "error_kind": result.error_kind,
+                        "truncated": result.truncated,
+                        "sandbox_backend": result.meta.get("sandbox_backend"),
+                        "sandboxed": result.meta.get("sandboxed"),
+                        "exit_code": result.meta.get("exit_code"),
+                    }
+                )
+            return result
+
+    async def _execute(
         self,
         call: ToolCall,
         *,

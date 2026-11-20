@@ -40,6 +40,7 @@ from bear_agent.core.events import EventType
 from bear_agent.core.fencing import LeaseFence
 from bear_agent.core.ids import new_id
 from bear_agent.observability.recorder import EventRecorder
+from bear_agent.observability.trace import span
 from bear_agent.secrets.redaction import SecretRedactor
 from bear_agent.sessions.service import SessionService
 from bear_agent.storage.continuity_repositories import (
@@ -121,6 +122,37 @@ class CheckpointService:
         the insert all happen inside one transaction. Retention pruning and the
         ``checkpoint.created`` event/audit record happen afterwards.
         """
+        async with span(
+            "checkpoint.create",
+            "checkpoint",
+            {"session_id": session_id, "run_id": run_id, "kind": kind},
+        ) as checkpoint_span:
+            record = await self._create(
+                session_id,
+                fence=fence,
+                kind=kind,
+                run_id=run_id,
+                turn_index=turn_index,
+            )
+            if checkpoint_span is not None:
+                checkpoint_span.set_attributes(
+                    {
+                        "checkpoint_id": record.id,
+                        "event_seq": record.event_seq,
+                        "message_seq": record.message_seq,
+                    }
+                )
+            return record
+
+    async def _create(
+        self,
+        session_id: str,
+        *,
+        fence: LeaseFence,
+        kind: str = "turn",
+        run_id: str | None = None,
+        turn_index: int | None = None,
+    ) -> CheckpointRecord:
         if not kind:
             raise ValueError("checkpoint kind must not be empty")
         created_at = self.clock.now()

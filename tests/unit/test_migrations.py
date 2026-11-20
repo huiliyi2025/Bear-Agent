@@ -70,6 +70,9 @@ def test_v1_database_migrates_to_current(tmp_path: Path) -> None:
             "tasks",
             "task_dependencies",
             "task_attempts",
+            "traces",
+            "spans",
+            "benchmark_runs",
         ):
             assert _columns(path, table), table
     finally:

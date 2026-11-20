@@ -45,6 +45,7 @@ from bear_agent.hooks.models import (
     HookStatus,
 )
 from bear_agent.observability.recorder import EventRecorder
+from bear_agent.observability.trace import span
 from bear_agent.secrets.redaction import SecretRedactor
 
 logger = logging.getLogger(__name__)
@@ -340,7 +341,27 @@ class HookManager:
                 reg: HookRegistration = registration,
                 inv: HookInvocation = invocation,
             ) -> HookDecision | None:
-                return await reg.handler(inv)
+                async with span(
+                    "hook",
+                    "hook",
+                    {
+                        "session_id": session_id,
+                        "run_id": run_id,
+                        "turn_id": turn_id,
+                        "hook_id": reg.id,
+                        "source": reg.source,
+                        "event": event.value,
+                    },
+                ) as hook_span:
+                    decision = await reg.handler(inv)
+                    if hook_span is not None and decision is not None:
+                        hook_span.set_attributes(
+                            {
+                                "action": decision.action,
+                                "context_append_chars": len(decision.context_append),
+                            }
+                        )
+                    return decision
 
             task: asyncio.Task[HookDecision | None] = asyncio.create_task(_invoke())
             try:

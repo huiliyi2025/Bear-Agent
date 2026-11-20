@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import sqlite3
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 
 SCHEMA_V1 = """
@@ -351,6 +351,88 @@ CREATE INDEX IF NOT EXISTS idx_task_attempts_session
 """
 
 
+SCHEMA_V6 = """
+CREATE TABLE IF NOT EXISTS traces (
+    trace_id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL,
+    run_id TEXT,
+    task_id TEXT,
+    name TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (
+        status IN ('running', 'ok', 'error', 'cancelled', 'incomplete')
+    ),
+    started_at TEXT NOT NULL,
+    ended_at TEXT,
+    duration_ms INTEGER,
+    attributes_json TEXT NOT NULL DEFAULT '{}',
+    error_type TEXT,
+    error_message TEXT,
+    span_count INTEGER NOT NULL DEFAULT 0,
+    dropped_spans INTEGER NOT NULL DEFAULT 0,
+    incomplete INTEGER NOT NULL DEFAULT 0,
+    sampled INTEGER NOT NULL DEFAULT 1,
+    schema_version INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_traces_session_time
+    ON traces (session_id, started_at DESC);
+CREATE INDEX IF NOT EXISTS idx_traces_run ON traces (run_id);
+CREATE INDEX IF NOT EXISTS idx_traces_task ON traces (task_id);
+CREATE INDEX IF NOT EXISTS idx_traces_status_time ON traces (status, started_at DESC);
+CREATE INDEX IF NOT EXISTS idx_traces_started ON traces (started_at DESC);
+
+CREATE TABLE IF NOT EXISTS spans (
+    span_id TEXT PRIMARY KEY,
+    trace_id TEXT NOT NULL REFERENCES traces(trace_id) ON DELETE CASCADE,
+    parent_span_id TEXT,
+    name TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (
+        status IN ('running', 'ok', 'error', 'cancelled', 'incomplete')
+    ),
+    started_at TEXT NOT NULL,
+    ended_at TEXT,
+    duration_ms INTEGER,
+    attributes_json TEXT NOT NULL DEFAULT '{}',
+    error_type TEXT,
+    error_message TEXT,
+    sequence INTEGER NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_spans_trace_seq ON spans (trace_id, sequence);
+CREATE INDEX IF NOT EXISTS idx_spans_parent ON spans (parent_span_id);
+CREATE INDEX IF NOT EXISTS idx_spans_name_time ON spans (name, started_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_events_span ON events (span_id);
+CREATE INDEX IF NOT EXISTS idx_events_created ON events (created_at);
+CREATE INDEX IF NOT EXISTS idx_tool_calls_started ON tool_calls (started_at);
+CREATE INDEX IF NOT EXISTS idx_model_calls_created ON model_calls (created_at);
+CREATE INDEX IF NOT EXISTS idx_tasks_updated ON tasks (updated_at);
+CREATE INDEX IF NOT EXISTS idx_compactions_created ON compactions (created_at);
+CREATE INDEX IF NOT EXISTS idx_checkpoints_created ON checkpoints (created_at);
+
+CREATE TABLE IF NOT EXISTS benchmark_runs (
+    id TEXT PRIMARY KEY,
+    scenario_id TEXT NOT NULL,
+    scenario_name TEXT NOT NULL,
+    category TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('completed', 'failed', 'skipped')),
+    started_at TEXT NOT NULL,
+    finished_at TEXT NOT NULL,
+    result_json TEXT NOT NULL,
+    app_version TEXT NOT NULL,
+    git_commit TEXT,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_benchmark_runs_scenario
+    ON benchmark_runs (scenario_id, started_at DESC);
+CREATE INDEX IF NOT EXISTS idx_benchmark_runs_time
+    ON benchmark_runs (started_at DESC);
+"""
+
+
 def migrate(conn: sqlite3.Connection) -> None:
     conn.execute("CREATE TABLE IF NOT EXISTS schema_meta (version INTEGER NOT NULL)")
     row = conn.execute("SELECT version FROM schema_meta LIMIT 1").fetchone()
@@ -383,4 +465,8 @@ def migrate(conn: sqlite3.Connection) -> None:
     if version < 5:
         conn.executescript(SCHEMA_V5)
         conn.execute("UPDATE schema_meta SET version = 5")
+        version = 5
+    if version < 6:
+        conn.executescript(SCHEMA_V6)
+        conn.execute("UPDATE schema_meta SET version = 6")
     conn.commit()

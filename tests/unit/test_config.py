@@ -201,6 +201,73 @@ allow_python = false
     assert "[plugins]" in rendered
 
 
+def test_observability_and_benchmark_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _clear_env(monkeypatch)
+    path = tmp_path / "config.toml"
+    path.write_text(
+        TOML
+        + """
+[observability]
+enabled = true
+traces_enabled = true
+metrics_enabled = true
+trace_sample_ratio = 0.5
+trace_retention_days = 7
+trace_max_traces = 1000
+incomplete_trace_grace_s = 60
+
+[observability.pricing."local:local-model"]
+input_per_million = 1.5
+output_per_million = 3.0
+cache_read_per_million = 0.1
+currency = "usd"
+
+[observability.pricing.local-model]
+input_per_million = 2.0
+output_per_million = 9.0
+currency = "usd"
+
+[benchmarks]
+default_iterations = 3
+default_warmup = 1
+max_iterations = 20
+compare_threshold_pct = 15
+""",
+        encoding="utf-8",
+    )
+    settings = load_settings(path)
+    assert settings.config_version == 1
+    assert settings.observability.trace_sample_ratio == 0.5
+    assert settings.observability.trace_retention_days == 7
+    price = settings.observability.price_for("local", "local-model")
+    assert price is not None
+    assert price.currency == "USD"
+    assert price.input_per_million == 1.5
+    model_price = settings.observability.price_for("other", "local-model")
+    assert model_price is not None
+    assert model_price.output_per_million == 9.0
+    assert settings.observability.price_for("local", "unknown") is None
+    assert settings.benchmarks.default_iterations == 3
+    assert settings.benchmarks.compare_threshold_pct == 15
+    rendered = settings_to_toml(settings)
+    assert "[observability]" in rendered
+    assert '[observability.pricing."local:local-model"]' in rendered
+    assert "[benchmarks]" in rendered
+    assert "secret-value" not in rendered
+
+
+def test_invalid_observability_values_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _clear_env(monkeypatch)
+    path = tmp_path / "config.toml"
+    path.write_text(TOML + "\n[observability]\ntrace_sample_ratio = 2.0\n", encoding="utf-8")
+    with pytest.raises(ConfigError, match="trace_sample_ratio"):
+        load_settings(path)
+
+
 def test_untrusted_mcp_server_rejected(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     _clear_env(monkeypatch)
     path = tmp_path / "config.toml"

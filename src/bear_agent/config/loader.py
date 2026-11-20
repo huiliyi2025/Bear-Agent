@@ -24,6 +24,8 @@ DEFAULT_CONFIG_TEMPLATE = """\
 #   export DEEPSEEK_API_KEY=...
 # `bear` reads BEAR_* overrides on top of this file.
 
+config_version = 1
+
 [agent]
 default_provider = "deepseek"
 default_model = "deepseek-chat"
@@ -151,6 +153,31 @@ enabled = true
 enabled = true
 allow_python = false
 # dirs = ["~/.local/share/bear-agent/plugins"]
+
+[observability]
+enabled = true
+traces_enabled = true
+metrics_enabled = true
+trace_sample_ratio = 1.0      # 1.0 = keep every run
+trace_retention_days = 14
+trace_max_traces = 50000
+incomplete_trace_grace_s = 3600
+# Cost is an estimate from these prices, never a provider invoice.
+# Keys: "provider:model", "model", "provider:*" or "*".
+# [observability.pricing."deepseek:deepseek-chat"]
+# input_per_million = 0.27
+# output_per_million = 1.10
+# cache_read_per_million = 0.07
+# currency = "USD"
+
+[benchmarks]
+enabled = true
+default_iterations = 10
+default_warmup = 2
+max_iterations = 200
+retention_days = 90
+max_runs = 1000
+compare_threshold_pct = 20.0
 
 # Any OpenAI-compatible endpoint works, including Ollama / vLLM / a relay:
 # [providers.local]
@@ -297,7 +324,7 @@ def settings_to_toml(settings: Settings) -> str:
     explicit so the output can be pasted into a config file. Secrets are never
     serialized.
     """
-    lines: list[str] = ["[agent]"]
+    lines: list[str] = [f"config_version = {settings.config_version}", "", "[agent]"]
     agent = settings.agent
     for key in (
         "default_provider",
@@ -371,6 +398,26 @@ def settings_to_toml(settings: Settings) -> str:
     for key in ("enabled", "allow_python", "max_plugins"):
         lines.append(f"{key} = {_toml_value(getattr(plugins, key))}")
     lines.append(f"dirs = {_toml_value([str(path) for path in plugins.dirs])}")
+    lines.extend(["", "[observability]"])
+    for key, value in settings.observability.model_dump(exclude={"pricing"}).items():
+        lines.append(f"{key} = {_toml_value(value)}")
+    lines.append(f"# pricing entries: {len(settings.observability.pricing)}")
+    for target, price in sorted(settings.observability.pricing.items()):
+        quoted = target.replace("\\", "\\\\").replace('"', '\\"')
+        lines.extend(
+            [
+                "",
+                f'[observability.pricing."{quoted}"]',
+                f"input_per_million = {_toml_value(price.input_per_million)}",
+                f"output_per_million = {_toml_value(price.output_per_million)}",
+                f"cache_read_per_million = {_toml_value(price.cache_read_per_million)}",
+                f"cache_write_per_million = {_toml_value(price.cache_write_per_million)}",
+                f"currency = {_toml_value(price.currency)}",
+            ]
+        )
+    lines.extend(["", "[benchmarks]"])
+    for key, value in settings.benchmarks.model_dump().items():
+        lines.append(f"{key} = {_toml_value(value)}")
     for name, provider in settings.providers.items():
         lines.append("")
         lines.append(f"[providers.{name}]")

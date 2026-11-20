@@ -367,7 +367,7 @@ schema_version = 1
 id = "demo"
 name = "Demo"
 version = "1.0.0"
-requires_bear = ">=0.4.0,<0.6.0"
+requires_bear = ">=0.4.0,<0.7.0"
 description = "test plugin"
 enabled_by_default = false
 

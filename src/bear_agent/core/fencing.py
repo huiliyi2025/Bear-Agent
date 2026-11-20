@@ -12,6 +12,7 @@ session service.
 
 from __future__ import annotations
 
+import threading
 from contextvars import ContextVar, Token
 from dataclasses import dataclass
 
@@ -51,3 +52,21 @@ def reset_fence(token: Token[LeaseFence | None]) -> None:
 def resolve_fence(fence: LeaseFence | None = None) -> LeaseFence | None:
     """Explicit fence wins; otherwise use the ambient run fence (if any)."""
     return fence if fence is not None else current_fence()
+
+
+# A process-local counter for rejected stale writes. It is diagnostic only:
+# incrementing it can never alter the fencing decision. Historical counts from
+# previous processes are not persisted, which the metrics report states.
+_fence_rejections = 0
+_fence_lock = threading.Lock()
+
+
+def note_fence_rejection() -> None:
+    global _fence_rejections
+    with _fence_lock:
+        _fence_rejections += 1
+
+
+def fence_rejections_total() -> int:
+    with _fence_lock:
+        return _fence_rejections

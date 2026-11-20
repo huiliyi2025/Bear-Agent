@@ -419,7 +419,143 @@ class PluginsConfig(BaseModel):
     max_plugins: int = 50
 
 
+class ModelPrice(BaseModel):
+    """Per-model price used for *estimated* cost reporting.
+
+    Prices are deliberately configuration, not code: vendors change them and a
+    local model often has no meaningful monetary price. Cost estimates are not
+    invoices; cache pricing and rounding differ between providers.
+    """
+
+    input_per_million: float = 0.0
+    output_per_million: float = 0.0
+    cache_read_per_million: float = 0.0
+    cache_write_per_million: float = 0.0
+    currency: str = "USD"
+
+    @field_validator(
+        "input_per_million",
+        "output_per_million",
+        "cache_read_per_million",
+        "cache_write_per_million",
+    )
+    @classmethod
+    def _non_negative(cls, value: float) -> float:
+        if value < 0:
+            raise ValueError("model prices must not be negative")
+        return value
+
+    @field_validator("currency")
+    @classmethod
+    def _currency(cls, value: str) -> str:
+        cleaned = value.strip().upper()
+        if not cleaned or len(cleaned) > 8:
+            raise ValueError("currency must be a short non-empty code")
+        return cleaned
+
+
+class ObservabilityConfig(BaseModel):
+    """Trace and metrics policy.
+
+    Trace rows are diagnostics, never a security mechanism. Metrics are
+    aggregated from authoritative domain tables and the event log instead of
+    being written a second time; this keeps the runtime write path lean.
+    """
+
+    enabled: bool = True
+    traces_enabled: bool = True
+    metrics_enabled: bool = True
+    # 1.0 keeps every run. Sampling is per root trace and recorded in its
+    # attributes so a gap is explainable.
+    trace_sample_ratio: float = 1.0
+    trace_batch_size: int = 32
+    trace_max_attributes_bytes: int = 8_192
+    trace_retention_days: int = 14
+    trace_max_traces: int = 50_000
+    # A running trace older than this is reported as incomplete. It is not
+    # auto-closed while a concurrently running process may still own it.
+    incomplete_trace_grace_s: int = 3_600
+    pricing: dict[str, ModelPrice] = Field(default_factory=dict)
+    default_currency: str = "USD"
+
+    @field_validator("trace_sample_ratio")
+    @classmethod
+    def _sample_ratio(cls, value: float) -> float:
+        if not 0.0 <= value <= 1.0:
+            raise ValueError("trace_sample_ratio must be in [0, 1]")
+        return value
+
+    @field_validator(
+        "trace_batch_size",
+        "trace_max_attributes_bytes",
+        "trace_retention_days",
+        "trace_max_traces",
+        "incomplete_trace_grace_s",
+    )
+    @classmethod
+    def _positive(cls, value: int) -> int:
+        if value <= 0:
+            raise ValueError("must be positive")
+        return value
+
+    @field_validator("default_currency")
+    @classmethod
+    def _currency(cls, value: str) -> str:
+        cleaned = value.strip().upper()
+        if not cleaned or len(cleaned) > 8:
+            raise ValueError("currency must be a short non-empty code")
+        return cleaned
+
+    def price_for(self, provider: str, model: str) -> ModelPrice | None:
+        """Look up the most specific configured price.
+
+        Precedence: ``provider:model``, then ``model``, then ``provider:*``,
+        then ``*``. A missing price is reported as "pricing unavailable"; the
+        cost is never fabricated.
+        """
+        candidates = (
+            f"{provider}:{model}",
+            model,
+            f"{provider}:*",
+            "*",
+        )
+        for key in candidates:
+            price = self.pricing.get(key)
+            if price is not None:
+                return price
+        return None
+
+
+class BenchmarksConfig(BaseModel):
+    enabled: bool = True
+    default_iterations: int = 10
+    default_warmup: int = 2
+    max_iterations: int = 200
+    retention_days: int = 90
+    max_runs: int = 1_000
+    # Used by `bench compare` to flag likely regressions.
+    compare_threshold_pct: float = 20.0
+
+    @field_validator(
+        "default_iterations", "default_warmup", "max_iterations", "retention_days", "max_runs"
+    )
+    @classmethod
+    def _non_negative(cls, value: int) -> int:
+        if value < 0:
+            raise ValueError("must not be negative")
+        return value
+
+    @field_validator("compare_threshold_pct")
+    @classmethod
+    def _threshold(cls, value: float) -> float:
+        if value < 0:
+            raise ValueError("compare_threshold_pct must not be negative")
+        return value
+
+
 class Settings(BaseModel):
+    # Bumped only when the configuration file format changes incompatibly.
+    config_version: int = 1
     providers: dict[str, ProviderConfig] = Field(
         default_factory=lambda: {"default": ProviderConfig()}
     )
@@ -438,6 +574,15 @@ class Settings(BaseModel):
     hooks: HooksConfig = Field(default_factory=HooksConfig)
     mcp: MCPConfig = Field(default_factory=MCPConfig)
     plugins: PluginsConfig = Field(default_factory=PluginsConfig)
+    observability: ObservabilityConfig = Field(default_factory=ObservabilityConfig)
+    benchmarks: BenchmarksConfig = Field(default_factory=BenchmarksConfig)
+
+    @field_validator("config_version")
+    @classmethod
+    def _config_version(cls, value: int) -> int:
+        if value != 1:
+            raise ValueError(f"unsupported config_version {value}; this build expects 1")
+        return value
 
     def provider(self, name: str | None = None) -> ProviderConfig:
         provider_name = name or self.agent.default_provider
@@ -469,7 +614,16 @@ class Settings(BaseModel):
 
     def ensure_data_dirs(self) -> Path:
         data_dir = self.resolved_data_dir()
-        for sub in (data_dir, data_dir / "artifacts", data_dir / "logs", data_dir / "backups"):
+        for sub in (
+            data_dir,
+            data_dir / "artifacts",
+            data_dir / "logs",
+            data_dir / "backups",
+            # External hooks and MCP servers run with a safe cwd outside the
+            # agent-writable workspace; that cwd must exist before spawn.
+            data_dir / "hooks",
+            data_dir / "mcp",
+        ):
             sub.mkdir(parents=True, exist_ok=True)
         return data_dir
 

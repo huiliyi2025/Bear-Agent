@@ -1080,3 +1080,31 @@ def test_build_unknown_primary_provider_raises() -> None:
 
     with pytest.raises(ConfigError, match="unknown provider"):
         build_fallback_provider(settings)
+
+
+@pytest.mark.asyncio
+async def test_early_consumer_exit_is_not_a_provider_failure(tmp_path) -> None:
+    from bear_agent.observability.trace import TraceService
+    from bear_agent.storage.database import Database
+
+    sink = EventSink()
+    provider = ScriptedProvider(
+        "primary",
+        [[TextDelta(text="a"), TextDelta(text="b"), FinishEvent()]],
+    )
+    router = FallbackProvider([_route("primary", provider)], on_event=sink)
+    db = Database(tmp_path / "router.db")
+    try:
+        tracer = TraceService(db)
+        async with tracer.trace("run", session_id="testsession"):
+            stream = router.stream(_request(), CancelToken())
+            first = await stream.__anext__()
+            assert isinstance(first, TextDelta)
+            await stream.aclose()
+        assert "provider.failed" not in sink.names()
+        assert router.status()[0]["failures"] == 0
+        spans = await tracer.spans((await tracer.list_traces())[0]["trace_id"])
+        assert any(span["name"] == "provider.attempt" for span in spans)
+        await tracer.close()
+    finally:
+        db.close()

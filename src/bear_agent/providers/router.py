@@ -45,6 +45,7 @@ from bear_agent.config.models import ProviderConfig, Settings
 from bear_agent.context.tokens import estimate_messages_tokens, estimate_tool_specs_tokens
 from bear_agent.core.cancel import CancelToken, RunCancelled
 from bear_agent.core.errors import ConfigError, ProviderError
+from bear_agent.observability.trace import current_tracer, span
 from bear_agent.providers.base import (
     ModelCapabilities,
     ModelEvent,
@@ -338,15 +339,25 @@ class FallbackProvider(ModelProvider):
 
             if index > 0:
                 fallbacks_used += 1
-                await self._emit(
-                    EVENT_FALLBACK,
+                async with span(
+                    "provider.fallback",
+                    "provider",
                     {
                         "from": fallback_from,
                         "to": route.name,
                         "model": route.model,
                         "category": fallback_reason,
                     },
-                )
+                ):
+                    await self._emit(
+                        EVENT_FALLBACK,
+                        {
+                            "from": fallback_from,
+                            "to": route.name,
+                            "model": route.model,
+                            "category": fallback_reason,
+                        },
+                    )
 
             attempts = max(1, route.retry_policy.max_attempts)
             delay_before_attempt = 0.0
@@ -360,16 +371,59 @@ class FallbackProvider(ModelProvider):
                 health = self._health[route.target]
                 health.total_attempts += 1
                 emitted = False
+                tracer = current_tracer()
+                attempt_span = (
+                    tracer.start_span(
+                        "provider.attempt",
+                        kind="provider",
+                        attributes={
+                            "provider": route.name,
+                            "model": used_model,
+                            "route_index": index,
+                            "attempt": attempt,
+                            "max_attempts": attempts,
+                        },
+                    )
+                    if tracer is not None
+                    else None
+                )
+                span_status = "ok"
                 try:
-                    async for event in route.provider.stream(route_request, cancel):
-                        if isinstance(event, ProviderErrorEvent):
-                            raise ProviderError(
-                                event.message,
-                                category=event.category,
-                                retryable=event.retryable,
+                    try:
+                        async for event in route.provider.stream(route_request, cancel):
+                            if isinstance(event, ProviderErrorEvent):
+                                raise ProviderError(
+                                    event.message,
+                                    category=event.category,
+                                    retryable=event.retryable,
+                                )
+                            emitted = True
+                            yield event
+                    except (RunCancelled, asyncio.CancelledError, GeneratorExit):
+                        span_status = "cancelled"
+                        raise
+                    except Exception as exc:
+                        span_status = "error"
+                        if attempt_span is not None:
+                            attempt_span.set_attributes(
+                                {
+                                    "emitted": emitted,
+                                    "error_category": _as_provider_error(exc).category,
+                                }
                             )
-                        emitted = True
-                        yield event
+                            attempt_span.fail(exc)
+                        raise
+                    finally:
+                        if attempt_span is not None and tracer is not None:
+                            if attempt_span.status is None:
+                                attempt_span.set_status(span_status)
+                            try:
+                                await tracer.end_span(attempt_span)
+                            except asyncio.CancelledError:
+                                raise
+                            except Exception:
+                                # Trace persistence must not alter provider behavior.
+                                pass
                 except (RunCancelled, asyncio.CancelledError):
                     self._clear_probe(health)
                     raise
@@ -415,8 +469,9 @@ class FallbackProvider(ModelProvider):
                     )
                     if attempt < attempts and should_retry(error):
                         delay = route.retry_policy.delay_for(attempt, error)
-                        await self._emit(
-                            EVENT_RETRY,
+                        async with span(
+                            "provider.retry",
+                            "provider",
                             {
                                 "provider": route.name,
                                 "model": route.model,
@@ -424,14 +479,25 @@ class FallbackProvider(ModelProvider):
                                 "next_attempt": attempt + 1,
                                 "delay_s": delay,
                                 "category": error.category,
-                                "retry_after_s": error.retry_after_s,
                             },
-                        )
-                        try:
-                            await _sleep_or_cancel(delay, cancel)
-                        except BaseException:
-                            self._clear_probes()
-                            raise
+                        ):
+                            await self._emit(
+                                EVENT_RETRY,
+                                {
+                                    "provider": route.name,
+                                    "model": route.model,
+                                    "attempt": attempt,
+                                    "next_attempt": attempt + 1,
+                                    "delay_s": delay,
+                                    "category": error.category,
+                                    "retry_after_s": error.retry_after_s,
+                                },
+                            )
+                            try:
+                                await _sleep_or_cancel(delay, cancel)
+                            except BaseException:
+                                self._clear_probes()
+                                raise
                         delay_before_attempt = delay
                         continue
 

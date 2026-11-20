@@ -31,7 +31,7 @@ schema_version = 1
 id = "demo"
 name = "Demo MCP plugin"
 version = "1.0.0"
-requires_bear = ">=0.4.0,<0.6.0"
+requires_bear = ">=0.4.0,<0.7.0"
 enabled_by_default = true
 
 [permissions]
@@ -99,7 +99,7 @@ schema_version = 1
 id = "py_echo"
 name = "Python echo"
 version = "1.0.0"
-requires_bear = ">=0.4.0,<0.6.0"
+requires_bear = ">=0.4.0,<0.7.0"
 enabled_by_default = true
 entrypoint = "plugin.py"
 

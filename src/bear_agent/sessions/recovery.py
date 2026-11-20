@@ -33,6 +33,7 @@ from bear_agent.core.events import EventType
 from bear_agent.core.fencing import LeaseFence
 from bear_agent.core.messages import Message, ToolCall, ToolMessage
 from bear_agent.observability.recorder import EventRecorder
+from bear_agent.observability.trace import span
 from bear_agent.sessions.checkpoints import CheckpointService
 from bear_agent.sessions.claims import ClaimService
 from bear_agent.sessions.service import SessionService
@@ -102,6 +103,34 @@ class RecoveryService:
         session (no running tools, no running processes and no dangling tool
         calls in the transcript) performs reads only and writes no events.
         """
+        async with span(
+            "recovery",
+            "recovery",
+            {"session_id": session_id, "run_id": run_id, "epoch": fence.epoch},
+        ) as recovery_span:
+            report = await self._recover_if_needed(session_id, fence=fence, run_id=run_id)
+            if recovery_span is not None:
+                recovery_span.set_attributes(
+                    {
+                        "recovered": report.recovered,
+                        "blocked": report.blocked,
+                        "running_tools": report.running_tools,
+                        "synthesized_tools": len(report.synthesized_tools),
+                        "released_claims": report.released_claims,
+                        "terminated_processes": report.terminated_processes,
+                        "checkpoint_id": report.checkpoint_id,
+                        "issues": len(report.issues),
+                    }
+                )
+            return report
+
+    async def _recover_if_needed(
+        self,
+        session_id: str,
+        *,
+        fence: LeaseFence,
+        run_id: str | None = None,
+    ) -> RecoveryReport:
         if not self.config.enabled:
             return RecoveryReport(recovered=False)
 

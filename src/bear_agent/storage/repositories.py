@@ -15,7 +15,7 @@ from typing import Any
 
 from bear_agent.core.errors import SessionLeaseError, StorageError
 from bear_agent.core.events import Event, EventType
-from bear_agent.core.fencing import LeaseFence, resolve_fence
+from bear_agent.core.fencing import LeaseFence, note_fence_rejection, resolve_fence
 from bear_agent.core.messages import Message
 from bear_agent.core.usage import TokenUsage, UsageSummary
 from bear_agent.sessions.models import SessionRecord
@@ -63,6 +63,7 @@ def assert_session_lease_row(
         or expires is None
         or expires <= current
     ):
+        note_fence_rejection()
         raise SessionLeaseError(
             f"session {session_id} lease is not owned by {fence.owner!r} "
             f"at epoch {fence.epoch} or has expired"
@@ -277,6 +278,7 @@ class SessionRepository:
             or expires is None
             or expires <= current
         ):
+            note_fence_rejection()
             raise SessionLeaseError(
                 f"session {session_id} lease is not owned by {owner!r} or has expired"
             )

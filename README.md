@@ -6,7 +6,7 @@ Bear-Agent 把模型变成有边界、可观测的执行者：每次工具调用
 
 ## 当前状态
 
-**阶段 5（Hooks / MCP / Plugins / Provider Fallback）已完成。** 当前版本支持：
+**阶段 6（Observability / Trace / Metrics / Diagnostics / Benchmark）已完成。** 当前版本支持：
 
 - 在 OpenAI 兼容流式端点上运行异步 Agent Loop；
 - 执行 Shell 命令：超时、输出上限、进程树终止、取消；
@@ -27,9 +27,13 @@ Bear-Agent 把模型变成有边界、可观测的执行者：每次工具调用
 - MCP：官方协议 Client、stdio 与 Streamable HTTP、工具发现/命名空间/Schema 校验/超时/取消/重连，接入 ToolExecutor 安全链；
 - Plugin：Manifest、版本/依赖/权限校验、MCP/Hook/Tool 贡献、显式受信任 Python 入口、CLI 管理；
 - Provider Fallback：多 Provider/Model 路由、Retry/Backoff/Jitter/Retry-After、Circuit Breaker、流式安全（partial stream 不重放）；
+- Trace：Run/Task/Turn/Model/Provider Retry/Fallback/Tool/MCP/Hook/Compression/Checkpoint/Recovery/Fork Span，父子关系、异步传播、批量持久化、脱敏导出与保留策略；
+- Metrics：从既有事件与领域表聚合 Run/Task/Provider/Model/Tool/Context/Recovery/System 指标、P50/P95/P99、Token、可配置价格成本估算、JSON 导出；
+- Diagnostics：结构化 `bear doctor`，静态检查与显式 `--active` 连通性检查分离；
+- Benchmark：43 个内置场景、Warmup、迭代统计、历史、比较、真实/脚本化 Provider 分离；
 - CLI 流式输出文本与工具状态，或输出 NDJSON 给脚本。
 
-暂未实现（见 [ROADMAP.md](docs/ROADMAP.md)）：Trace/评估、子代理、完整 TUI。
+暂未实现（见 [ROADMAP.md](docs/ROADMAP.md)）：完整 TUI、子代理、Web UI、独立 Eval 质量套件。
 
 ## 环境要求
 
@@ -64,7 +68,8 @@ bear --help
 ```bash
 bear init                 # 写入 ~/.config/bear-agent/config.toml
 export DEEPSEEK_API_KEY=...
-bear doctor               # 检查配置、存储、Provider、Sandbox、keyring、审计
+bear doctor               # 结构化诊断配置、存储、Provider、Sandbox、审计、Trace/Metrics
+bear doctor --json        # 机器可读诊断报告
 bear                      # 进入交互会话
 ```
 
@@ -116,6 +121,45 @@ bear plugins list/validate/info ID  # Plugin 管理
 bear plugins enable/disable ID
 bear hooks list                     # Hook 配置
 ```
+
+可观测性与 Benchmark：
+
+```bash
+bear trace list                     # 最近 Trace
+bear trace show <trace-id> --events # Span 树 + 关联事件类型
+bear trace run <run-id>             # 按 Run 还原执行路径
+bear trace export --trace <id> -o trace.json
+bear trace stats                    # Trace/不完整计数
+bear trace prune --yes              # 按保留策略删除
+
+bear metrics show                   # Run/Task/Model/Tool/Context/Recovery/System
+bear metrics providers              # Provider/Model 分布、Token、成本估算
+bear metrics tools                  # Tool 分布、超时、审批、Sandbox、MCP、Hook
+bear metrics tasks                  # Task 完成率、重试、Plan 修订
+bear metrics recovery               # Recovery/Checkpoint/Fencing
+bear metrics export -o metrics.json
+
+bear bench list                     # 43 个内置场景
+bear bench run e2e.single_tool      # 运行并保存
+bear bench run kernel.trace_write --iterations 5 --trace
+bear bench history --scenario e2e.single_tool
+bear bench compare <run-a> <run-b>  # 同一场景/参数
+bear bench report <run-id> --samples
+bear bench export <run-id> -o bench.json
+bear bench prune --yes             # 按保留策略清理历史
+bear bench run provider.real_request --allow-network  # 真实 Provider，可能产生费用
+```
+
+成本估算需要配置价格；没有价格时报告 `pricing_missing`，不会编造费用：
+
+```toml
+[observability.pricing."deepseek:deepseek-chat"]
+input_per_million = 0.27
+output_per_million = 1.10
+currency = "USD"
+```
+
+`bear doctor --active` 会发送一个最小 Provider 请求，并启动已配置的 MCP Server；默认静态检查不会执行这些操作。Trace 默认只记录元数据，不记录 Prompt/工具参数/工具结果。
 
 不修改配置文件，直接覆盖 Provider：
 
@@ -195,7 +239,10 @@ bear sessions show <id>      会话记录 + 用量
 bear config show             当前生效配置（已脱敏）
 bear config path             默认配置路径
 bear init                    创建初始配置
-bear doctor                  就绪检查（Sandbox、keyring、审计）
+bear doctor                  结构化诊断（--json/--export/--active/--category）
+bear trace ...               Trace 查询/导出/裁剪
+bear metrics ...             Metrics 聚合/导出
+bear bench ...               Benchmark 运行/历史/比较
 bear audit verify            验证审计哈希链
 bear audit tail              最近审计记录
 bear secret set <name>       把密钥写入 OS keyring
@@ -203,7 +250,7 @@ bear secret list             列出密钥名称（不显示值）
 bear secret delete <name>    删除密钥
 ```
 
-交互式 Slash 命令：`/help`、`/tools`、`/session`、`/permission <mode>`、`/new`、`/exit`。
+交互式 Slash 命令：`/help`、`/tools`、`/metrics`、`/session`、`/permission <mode>`、`/new`、`/exit` 等。
 
 ## 权限模式
 

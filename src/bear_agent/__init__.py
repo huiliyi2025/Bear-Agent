@@ -1,3 +1,3 @@
 """Bear-Agent — a local-first, recoverable, extensible agent harness."""
 
-__version__ = "0.5.0"
+__version__ = "0.6.0"

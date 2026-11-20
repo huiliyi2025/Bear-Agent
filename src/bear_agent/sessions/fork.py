@@ -27,6 +27,7 @@ from bear_agent.core.events import Event, EventType
 from bear_agent.core.ids import new_id
 from bear_agent.core.messages import Message
 from bear_agent.observability.recorder import EventRecorder
+from bear_agent.observability.trace import current_span_ids, span
 from bear_agent.sessions.checkpoints import CheckpointService
 from bear_agent.sessions.models import SessionRecord
 from bear_agent.sessions.service import SessionService
@@ -117,6 +118,40 @@ class SessionForkService:
         error. The cut is moved back when necessary by :func:`safe_cut`, so the
         returned ``cut_message_seq`` is the effective, balanced position.
         """
+        async with span(
+            "session.fork",
+            "fork",
+            {
+                "source_session_id": source_session_id,
+                "at_message_seq": at_message_seq,
+                "checkpoint_id": checkpoint_id,
+            },
+        ) as fork_span:
+            result = await self._fork(
+                source_session_id,
+                at_message_seq=at_message_seq,
+                checkpoint_id=checkpoint_id,
+                title=title,
+                checkpoints=checkpoints,
+            )
+            if fork_span is not None:
+                fork_span.set_attributes(
+                    {
+                        "session_id": result.session.id,
+                        "cut_message_seq": result.cut_message_seq,
+                    }
+                )
+            return result
+
+    async def _fork(
+        self,
+        source_session_id: str,
+        *,
+        at_message_seq: int | None = None,
+        checkpoint_id: str | None = None,
+        title: str | None = None,
+        checkpoints: CheckpointService | None = None,
+    ) -> ForkResult:
         if at_message_seq is not None and checkpoint_id is not None:
             raise ForkError("specify either at_message_seq or checkpoint_id, not both")
         source = await self.sessions.get(source_session_id)
@@ -316,11 +351,14 @@ class SessionForkService:
                     ),
                 )
 
+            span_id, parent_span_id = current_span_ids()
             created_event = Event(
                 session_id=new_session.id,
                 seq=1,
                 type=EventType.SESSION_CREATED,
                 ts=now,
+                span_id=span_id,
+                parent_span_id=parent_span_id,
                 payload={
                     "cwd": new_session.cwd,
                     "model": new_session.model,
@@ -334,6 +372,8 @@ class SessionForkService:
                 seq=2,
                 type=EventType.SESSION_FORKED,
                 ts=now,
+                span_id=span_id,
+                parent_span_id=parent_span_id,
                 payload={
                     "source_session_id": source_session_id,
                     "cut_message_seq": cut,

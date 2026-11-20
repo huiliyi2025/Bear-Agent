@@ -7,6 +7,7 @@ graph.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 from dataclasses import dataclass
 from pathlib import Path
@@ -28,7 +29,11 @@ from bear_agent.hooks.models import HookRegistration
 from bear_agent.mcp.manager import MCPManager
 from bear_agent.observability.bus import EventBus
 from bear_agent.observability.logging import install_redacting_filter
+from bear_agent.observability.metrics.live import LiveMetricsCollector
+from bear_agent.observability.metrics.query import MetricsService
+from bear_agent.observability.metrics.registry import MetricsRegistry
 from bear_agent.observability.recorder import EventRecorder
+from bear_agent.observability.trace.service import TraceService
 from bear_agent.plugins.api import PluginContext, PluginLoadReport
 from bear_agent.plugins.manager import PluginManager
 from bear_agent.policy.approvals import ApprovalService
@@ -98,9 +103,14 @@ class Maintenance:
     recovery: RecoveryService
     fork: SessionForkService
     tasks: TaskService
+    tracer: TraceService
+    metrics: MetricsService
 
     async def close(self) -> None:
-        self.db.close()
+        try:
+            await self.tracer.close()
+        finally:
+            self.db.close()
 
 
 def build_maintenance(
@@ -118,6 +128,8 @@ def build_maintenance(
         redactor = SecretRedactor()
         recorder = EventRecorder(sessions, event_bus, redactor)
         audit = AuditService(db, redactor=redactor, clock=clock, enabled=settings.audit.enabled)
+        tracer = TraceService(db, config=settings.observability, redactor=redactor, clock=clock)
+        metrics = MetricsService(db, config=settings.observability, clock=clock, settings=settings)
         task_service = TaskService(
             db,
             recorder,
@@ -182,6 +194,8 @@ def build_maintenance(
             recovery=recovery,
             fork=fork,
             tasks=task_service,
+            tracer=tracer,
+            metrics=metrics,
         )
     except BaseException:
         db.close()
@@ -224,16 +238,25 @@ class Container:
     task_verifier: ModelTaskVerifier
     task_engine: TaskEngine | None
     hooks: HookManager
+    tracer: TraceService
+    metrics: MetricsService
+    metrics_registry: MetricsRegistry
     mcp: MCPManager | None = None
     plugins: PluginManager | None = None
     plugin_report: PluginLoadReport | None = None
     _hooks_unsubscribe: Any = None
+    _metrics_unsubscribe: Any = None
     _started: bool = False
+    _closed: bool = False
 
     async def startup(self) -> None:
-        """Load plugins and connect MCP servers."""
+        """Load plugins, connect MCP servers and reconcile diagnostics."""
         if self._started:
             return
+        with contextlib.suppress(Exception):
+            await self.tracer.reconcile_incomplete()
+        with contextlib.suppress(Exception):
+            await self.tracer.prune()
         report: PluginLoadReport | None = None
         if self.plugins is not None:
             counter = 0
@@ -285,16 +308,27 @@ class Container:
         self._started = True
 
     async def close(self) -> None:
-        if self.mcp is not None:
-            await self.mcp.stop()
-        if self.plugins is not None:
-            await self.plugins.unload_all()
-        if self._hooks_unsubscribe is not None:
-            self._hooks_unsubscribe()
+        if self._closed:
+            return
+        self._closed = True
         try:
-            await self.provider.aclose()
+            if self.mcp is not None:
+                with contextlib.suppress(Exception):
+                    await self.mcp.stop()
+            if self.plugins is not None:
+                with contextlib.suppress(Exception):
+                    await self.plugins.unload_all()
+            if self._hooks_unsubscribe is not None:
+                self._hooks_unsubscribe()
+            if self._metrics_unsubscribe is not None:
+                self._metrics_unsubscribe()
+            with contextlib.suppress(Exception):
+                await self.provider.aclose()
         finally:
-            self.db.close()
+            try:
+                await self.tracer.close()
+            finally:
+                self.db.close()
 
 
 def build_container(
@@ -317,6 +351,14 @@ def build_container(
         install_redacting_filter(redactor)
         recorder = EventRecorder(sessions, event_bus, redactor)
         audit = AuditService(db, redactor=redactor, clock=clock, enabled=settings.audit.enabled)
+        tracer = TraceService(db, config=settings.observability, redactor=redactor, clock=clock)
+        metrics = MetricsService(db, config=settings.observability, clock=clock, settings=settings)
+        metrics_registry = MetricsRegistry()
+        if settings.observability.enabled and settings.observability.metrics_enabled:
+            live_metrics = LiveMetricsCollector(metrics_registry)
+            metrics_unsubscribe = event_bus.subscribe(live_metrics.on_event)
+        else:
+            metrics_unsubscribe = None
 
         provider_event_types = {
             "provider.selected": EventType.PROVIDER_SELECTED,
@@ -585,6 +627,7 @@ def build_container(
             checkpoint_interval=settings.checkpoints.interval_turns,
             task_engine=task_engine,
             task_max_turns=settings.tasks.max_task_turns,
+            tracer=tracer,
         )
         fork = SessionForkService(
             sessions=sessions,
@@ -628,8 +671,12 @@ def build_container(
             task_verifier=task_verifier,
             task_engine=task_engine,
             hooks=hooks,
+            tracer=tracer,
+            metrics=metrics,
+            metrics_registry=metrics_registry,
             plugins=plugin_manager,
             _hooks_unsubscribe=hooks_unsubscribe,
+            _metrics_unsubscribe=metrics_unsubscribe,
         )
     except BaseException:
         db.close()

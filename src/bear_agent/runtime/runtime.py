@@ -12,6 +12,7 @@ import asyncio
 import contextlib
 import logging
 import os
+from contextlib import AsyncExitStack
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -28,6 +29,7 @@ from bear_agent.core.fencing import LeaseFence, reset_fence, set_fence
 from bear_agent.core.ids import new_id
 from bear_agent.core.usage import TokenUsage
 from bear_agent.observability.recorder import EventRecorder
+from bear_agent.observability.trace import TraceScope, TraceService, TraceStatus, span
 from bear_agent.runtime.stop_policy import (
     BudgetTracker,
     RunStatus,
@@ -91,6 +93,7 @@ class AgentRuntime:
         checkpoint_interval: int = 0,
         task_engine: TaskEngine | None = None,
         task_max_turns: int = 20,
+        tracer: TraceService | None = None,
     ) -> None:
         self.sessions = sessions
         self.turn_executor = turn_executor
@@ -106,6 +109,7 @@ class AgentRuntime:
         self.checkpoint_interval = checkpoint_interval
         self.task_engine = task_engine
         self.task_max_turns = task_max_turns or max_turns
+        self.tracer = tracer
         self._locks: dict[str, asyncio.Lock] = {}
         self._active: dict[str, _ActiveRun] = {}
 
@@ -148,7 +152,27 @@ class AgentRuntime:
                 self._heartbeat(session_id, owner, epoch, cancel, stop_event)
             )
             outcome = _RequestOutcome(status=RunStatus.FAILED, reason="run failed")
+            trace_stack = AsyncExitStack()
+            trace_scope: TraceScope | None = None
             try:
+                if self.tracer is not None:
+                    trace_scope = await trace_stack.enter_async_context(
+                        self.tracer.trace(
+                            "run",
+                            kind="run",
+                            session_id=session_id,
+                            run_id=run_id,
+                            attributes={
+                                "provider": self.turn_executor.provider_name,
+                                "model": self.turn_executor.model,
+                                "permission_mode": str(
+                                    self.turn_executor.tool_executor.policy.mode
+                                ),
+                                "max_turns": self.max_turns,
+                                "stream": self.turn_executor.stream,
+                            },
+                        )
+                    )
                 outcome = await self._execute_request(
                     session,
                     user_input,
@@ -164,20 +188,35 @@ class AgentRuntime:
             finally:
                 stop_event.set()
                 heartbeat.cancel()
-                await asyncio.gather(heartbeat, return_exceptions=True)
-                await self._finish_request_writes(
-                    session_id,
-                    run_id,
-                    fence=fence,
-                    owner=owner,
-                    epoch=epoch,
-                    outcome=outcome,
-                    release_lease=True,
-                    set_idle=True,
-                    record_end=True,
-                )
                 reset_fence(fence_token)
                 self._active.pop(session_id, None)
+                try:
+                    await asyncio.gather(heartbeat, return_exceptions=True)
+                    await self._finish_request_writes(
+                        session_id,
+                        run_id,
+                        fence=fence,
+                        owner=owner,
+                        epoch=epoch,
+                        outcome=outcome,
+                        release_lease=True,
+                        set_idle=True,
+                        record_end=True,
+                    )
+                    if trace_scope is not None:
+                        trace_scope.set_attributes(
+                            {
+                                "turns": outcome.turns,
+                                "usage": outcome.usage.model_dump(),
+                                "stop_reason": outcome.reason,
+                                "run_status": outcome.status.value,
+                            }
+                        )
+                        trace_scope.set_status(_trace_status(outcome.status), error=outcome.error)
+                finally:
+                    with contextlib.suppress(Exception):
+                        await self.sessions.release_lease(session_id, owner, epoch)
+                    await trace_stack.aclose()
             return RunResult(
                 session_id=session_id,
                 run_id=run_id,
@@ -401,10 +440,43 @@ class AgentRuntime:
             )
             report = TaskRunReport(session_id=session_id, status="failed")
             tasks_run = 0
+            trace_stack = AsyncExitStack()
+            trace_scope: TraceScope | None = None
+            if self.tracer is not None:
+                try:
+                    trace_scope = await trace_stack.enter_async_context(
+                        self.tracer.trace(
+                            "plan_run",
+                            kind="plan_run",
+                            session_id=session_id,
+                            run_id=plan_run_id,
+                            attributes={
+                                "provider": self.turn_executor.provider_name,
+                                "model": self.turn_executor.model,
+                                "max_tasks_per_run": self.task_engine.config.max_tasks_per_run,
+                            },
+                        )
+                    )
+                except BaseException:
+                    # Trace setup awaits SQLite before the main try/finally.
+                    # A cancellation here must not leave a lease heartbeat.
+                    stop_event.set()
+                    heartbeat.cancel()
+                    with contextlib.suppress(Exception):
+                        await asyncio.gather(heartbeat, return_exceptions=True)
+                    reset_fence(fence_token)
+                    self._active.pop(session_id, None)
+                    with contextlib.suppress(Exception):
+                        await self.sessions.release_lease(session_id, owner, epoch)
+                    with contextlib.suppress(Exception):
+                        await trace_stack.aclose()
+                    raise
             try:
                 self.task_engine.reset_budget()
                 await self.sessions.set_status(session_id, "active")
                 plan = await self.task_engine.tasks.get_plan(session_id)
+                if trace_scope is not None and plan is not None:
+                    trace_scope.set_attributes({"plan_id": plan.id, "plan_version": plan.version})
                 await self.recorder.record(
                     session_id,
                     EventType.TASK_RUN_STARTED,
@@ -428,68 +500,101 @@ class AgentRuntime:
                     if tasks_run >= self.task_engine.config.max_tasks_per_run:
                         break
                     task_run_id = new_id("run")
-                    execution = await self.task_engine.start_next(
-                        session_id, fence=fence, run_id=task_run_id
-                    )
-                    if execution is None:
-                        break
-                    tasks_run += 1
-                    outcome = await self._execute_request(
-                        session,
-                        execution.prompt,
-                        run_id=task_run_id,
-                        owner=owner,
-                        epoch=epoch,
-                        fence=fence,
-                        cancel=cancel,
-                        max_turns=self.task_max_turns,
-                        run_recovery=False,
-                        allow_title=False,
-                        extra_payload={
-                            "task_id": execution.task.id,
-                            "task_key": execution.task.task_key,
-                            "plan_run_id": plan_run_id,
-                        },
-                    )
-                    await self._finish_request_writes(
-                        session_id,
-                        task_run_id,
-                        fence=fence,
-                        owner=owner,
-                        epoch=epoch,
-                        outcome=outcome,
-                        release_lease=False,
-                        set_idle=False,
-                        record_end=True,
-                    )
-                    if outcome.status == RunStatus.CANCELLED:
-                        await self.task_engine.cancel(
-                            session_id, fence=fence, reason="run cancelled by user"
+                    async with span(
+                        "task",
+                        "task",
+                        {"plan_run_id": plan_run_id, "run_id": task_run_id},
+                    ) as task_span:
+                        execution = await self.task_engine.start_next(
+                            session_id, fence=fence, run_id=task_run_id
                         )
-                        cancel.cancel()
-                        break
-                    decision = await self.task_engine.finish(
-                        execution,
-                        TaskRunOutcome(
-                            status=outcome.status.value,
-                            final_text=outcome.final_text,
-                            error=outcome.error,
-                            turns=outcome.turns,
-                        ),
-                        fence=fence,
-                        run_id=task_run_id,
-                    )
-                    await self._record_task_checkpoint(session_id, fence=fence, run_id=task_run_id)
-                    plan = await self.task_engine.tasks.get_plan(session_id)
-                    if plan is not None and plan.status in {
-                        PlanStatus.COMPLETED,
-                        PlanStatus.CANCELLED,
-                    }:
-                        break
-                    if decision.outcome in {"blocked", "failed"} and (
-                        plan is None or plan.status != PlanStatus.ACTIVE
-                    ):
-                        break
+                        if execution is None:
+                            if task_span is not None:
+                                task_span.set_attribute("claimed", False)
+                            break
+                        tasks_run += 1
+                        if task_span is not None:
+                            task_span.set_attributes(
+                                {
+                                    "task_id": execution.task.id,
+                                    "task_key": execution.task.task_key,
+                                    "attempt": execution.attempt.attempt_no,
+                                    "verification": execution.task.verification.value,
+                                }
+                            )
+                        outcome = await self._execute_request(
+                            session,
+                            execution.prompt,
+                            run_id=task_run_id,
+                            owner=owner,
+                            epoch=epoch,
+                            fence=fence,
+                            cancel=cancel,
+                            max_turns=self.task_max_turns,
+                            run_recovery=False,
+                            allow_title=False,
+                            extra_payload={
+                                "task_id": execution.task.id,
+                                "task_key": execution.task.task_key,
+                                "plan_run_id": plan_run_id,
+                            },
+                        )
+                        await self._finish_request_writes(
+                            session_id,
+                            task_run_id,
+                            fence=fence,
+                            owner=owner,
+                            epoch=epoch,
+                            outcome=outcome,
+                            release_lease=False,
+                            set_idle=False,
+                            record_end=True,
+                        )
+                        if outcome.status == RunStatus.CANCELLED:
+                            if task_span is not None:
+                                task_span.set_attribute("task_outcome", "cancelled")
+                                task_span.set_status("cancelled")
+                            await self.task_engine.cancel(
+                                session_id, fence=fence, reason="run cancelled by user"
+                            )
+                            cancel.cancel()
+                            break
+                        decision = await self.task_engine.finish(
+                            execution,
+                            TaskRunOutcome(
+                                status=outcome.status.value,
+                                final_text=outcome.final_text,
+                                error=outcome.error,
+                                turns=outcome.turns,
+                            ),
+                            fence=fence,
+                            run_id=task_run_id,
+                        )
+                        await self._record_task_checkpoint(
+                            session_id, fence=fence, run_id=task_run_id
+                        )
+                        if task_span is not None:
+                            task_span.set_attributes(
+                                {
+                                    "task_outcome": decision.outcome,
+                                    "verified": decision.verified,
+                                    "task_status": decision.task.status.value,
+                                }
+                            )
+                            if decision.outcome in {"failed", "blocked"}:
+                                task_span.set_status("error")
+                            elif decision.outcome == "completed":
+                                task_span.set_status("ok")
+                        plan = await self.task_engine.tasks.get_plan(session_id)
+                        if plan is not None and plan.status in {
+                            PlanStatus.COMPLETED,
+                            PlanStatus.CANCELLED,
+                        }:
+                            break
+                        if decision.outcome in {"blocked", "failed"} and (
+                            plan is None or plan.status != PlanStatus.ACTIVE
+                        ):
+                            break
                 report = await self.task_engine.report(
                     session_id,
                     reason=self.task_engine.last_stop_reason,
@@ -549,43 +654,67 @@ class AgentRuntime:
             finally:
                 stop_event.set()
                 heartbeat.cancel()
-                await asyncio.gather(heartbeat, return_exceptions=True)
-                # Any attempt left running by an unexpected failure becomes
-                # visibly blocked rather than silently retried next time.
-                with contextlib.suppress(Exception):
-                    await self.task_engine.reconcile(session_id, fence=fence, run_id=plan_run_id)
-                # Recompute after reconciliation so a failed run cannot return a
-                # stale "active" report while the DB says blocked/failed.
-                with contextlib.suppress(Exception):
-                    report = await self.task_engine.report(
-                        session_id,
-                        reason=report.reason or "plan run finished",
-                        issues=list(report.issues) or None,
-                    )
-                cleanup_outcome = _RequestOutcome(
-                    status=(
-                        RunStatus.CANCELLED
-                        if report.status == "cancelled"
-                        else RunStatus.COMPLETED
-                        if report.status in {"completed", "active", "blocked", "draft"}
-                        else RunStatus.FAILED
-                    ),
-                    reason=report.reason or "plan run finished",
-                    error="; ".join(report.issues) or None,
-                )
-                await self._finish_request_writes(
-                    session_id,
-                    plan_run_id,
-                    fence=fence,
-                    owner=owner,
-                    epoch=epoch,
-                    outcome=cleanup_outcome,
-                    release_lease=True,
-                    set_idle=True,
-                    record_end=False,
-                )
                 reset_fence(fence_token)
                 self._active.pop(session_id, None)
+                try:
+                    await asyncio.gather(heartbeat, return_exceptions=True)
+                    # Any attempt left running by an unexpected failure becomes
+                    # visibly blocked rather than silently retried next time.
+                    with contextlib.suppress(Exception):
+                        await self.task_engine.reconcile(
+                            session_id, fence=fence, run_id=plan_run_id
+                        )
+                    # Recompute after reconciliation so a failed run cannot return a
+                    # stale "active" report while the DB says blocked/failed.
+                    with contextlib.suppress(Exception):
+                        report = await self.task_engine.report(
+                            session_id,
+                            reason=report.reason or "plan run finished",
+                            issues=list(report.issues) or None,
+                        )
+                    cleanup_outcome = _RequestOutcome(
+                        status=(
+                            RunStatus.CANCELLED
+                            if report.status == "cancelled"
+                            else RunStatus.COMPLETED
+                            if report.status in {"completed", "active", "blocked", "draft"}
+                            else RunStatus.FAILED
+                        ),
+                        reason=report.reason or "plan run finished",
+                        error="; ".join(report.issues) or None,
+                    )
+                    await self._finish_request_writes(
+                        session_id,
+                        plan_run_id,
+                        fence=fence,
+                        owner=owner,
+                        epoch=epoch,
+                        outcome=cleanup_outcome,
+                        release_lease=True,
+                        set_idle=True,
+                        record_end=False,
+                    )
+                finally:
+                    with contextlib.suppress(Exception):
+                        await self.sessions.release_lease(session_id, owner, epoch)
+                    if trace_scope is not None:
+                        trace_scope.set_attributes(
+                            {
+                                "plan_id": report.plan_id,
+                                "plan_status": report.status,
+                                "tasks_run": report.tasks_run,
+                                "tasks_completed": report.tasks_completed,
+                                "tasks_failed": report.tasks_failed,
+                                "tasks_blocked": report.tasks_blocked,
+                                "revisions": report.revisions,
+                                "stop_reason": report.reason,
+                            }
+                        )
+                        trace_scope.set_status(
+                            _plan_trace_status(report.status),
+                            error="; ".join(report.issues) or None,
+                        )
+                    await trace_stack.aclose()
             return report
 
     async def _record_task_checkpoint(
@@ -681,3 +810,19 @@ class AgentRuntime:
                     logger.exception("claim heartbeat failed")
                     cancel.cancel()
                     return
+
+
+def _trace_status(status: RunStatus) -> TraceStatus:
+    if status == RunStatus.COMPLETED:
+        return "ok"
+    if status == RunStatus.CANCELLED:
+        return "cancelled"
+    return "error"
+
+
+def _plan_trace_status(status: str) -> TraceStatus:
+    if status in {"completed", "active"}:
+        return "ok"
+    if status == "cancelled":
+        return "cancelled"
+    return "error"
