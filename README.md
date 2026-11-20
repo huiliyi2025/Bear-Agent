@@ -6,7 +6,7 @@ Bear-Agent 把模型变成有边界、可观测的执行者：每次工具调用
 
 ## 当前状态
 
-**阶段 6（Observability / Trace / Metrics / Diagnostics / Benchmark）已完成。** 当前版本支持：
+**阶段 7（Interactive UX / TUI / Release Readiness）已完成。** 当前版本支持：
 
 - 在 OpenAI 兼容流式端点上运行异步 Agent Loop；
 - 执行 Shell 命令：超时、输出上限、进程树终止、取消；
@@ -31,9 +31,10 @@ Bear-Agent 把模型变成有边界、可观测的执行者：每次工具调用
 - Metrics：从既有事件与领域表聚合 Run/Task/Provider/Model/Tool/Context/Recovery/System 指标、P50/P95/P99、Token、可配置价格成本估算、JSON 导出；
 - Diagnostics：结构化 `bear doctor`，静态检查与显式 `--active` 连通性检查分离；
 - Benchmark：43 个内置场景、Warmup、迭代统计、历史、比较、真实/脚本化 Provider 分离；
+- TUI：全屏 Transcript、Plan/Task 侧栏、完整审批 Modal、Run 取消、Session 切换/Fork、Provider/Context/Checkpoint/MCP/Plugin/Hook 状态；
 - CLI 流式输出文本与工具状态，或输出 NDJSON 给脚本。
 
-暂未实现（见 [ROADMAP.md](docs/ROADMAP.md)）：完整 TUI、子代理、Web UI、独立 Eval 质量套件。
+暂未实现（见 [ROADMAP.md](docs/ROADMAP.md)）：子代理、Web UI/Server、独立 Eval 质量套件。
 
 ## 环境要求
 
@@ -66,11 +67,13 @@ bear --help
 ## 快速开始
 
 ```bash
-bear init                 # 写入 ~/.config/bear-agent/config.toml
+bear init                 # 写入平台配置目录（见 bear config path）
 export DEEPSEEK_API_KEY=...
 bear doctor               # 结构化诊断配置、存储、Provider、Sandbox、审计、Trace/Metrics
 bear doctor --json        # 机器可读诊断报告
-bear                      # 进入交互会话
+bear                      # 真实终端进入 TUI；非 TTY 回退 chat
+bear tui                  # 显式进入 TUI（需要 TTY）
+bear chat                 # 经典流式 chat
 ```
 
 单次执行：
@@ -170,6 +173,14 @@ bear run "hello" \
   --api-key "$DEEPSEEK_API_KEY"
 ```
 
+## 文档
+
+- [TUI 使用与架构](docs/TUI.md)
+- [CLI 参考](docs/CLI.md)
+- [Troubleshooting](docs/TROUBLESHOOTING.md)
+- [架构](docs/ARCHITECTURE.md) · [安全](docs/SECURITY.md) · [开发](docs/DEVELOPMENT.md)
+- [P7 完成报告](docs/P7-COMPLETION-REPORT.md)
+
 ## 配置
 
 配置格式为 TOML。优先级：CLI 参数 > `BEAR_*` 环境变量 > 配置文件 > 内置默认值。
@@ -250,7 +261,7 @@ bear secret list             列出密钥名称（不显示值）
 bear secret delete <name>    删除密钥
 ```
 
-交互式 Slash 命令：`/help`、`/tools`、`/metrics`、`/session`、`/permission <mode>`、`/new`、`/exit` 等。
+TUI 快捷键与命令见 [docs/TUI.md](docs/TUI.md)；经典 chat 仍支持 `/help`、`/tools`、`/metrics`、`/session`、`/permission <mode>`、`/new`、`/exit` 等。
 
 ## 权限模式
 
@@ -284,7 +295,7 @@ Shell 执行是一条流水线，而不是 Prompt 约定：
 | 平台 | 后端 | 文件系统隔离 | 网络控制 |
 |---|---|---|---|
 | Linux | bubblewrap（`bwrap`） | 是：系统只读、工作区可写、私有 `/tmp` | 默认 `--unshare-net`，可配置开启 |
-| macOS | `sandbox-exec` Seatbelt | 是：默认拒绝、工作区/临时目录可写 | 默认拒绝，可配置开启 |
+| macOS | `sandbox-exec` Seatbelt | 配置文件按默认拒绝设计；真实执行未验证 | 默认拒绝，可配置开启 |
 | Windows | Job Object | **否**：仅进程树、进程数、内存限制 | 无 |
 | 任意 | `off` | 无（显式关闭） | 无 |
 

@@ -208,6 +208,15 @@ uv run bear bench run kernel.trace_write_disabled --iterations 5 --warmup 2
 uv run bear bench run e2e.single_tool --iterations 5 --warmup 2
 ```
 
+## TUI 开发
+
+- 业务行为放在 Container/Service，不放进 Widget；TUI 只调用现有 API。
+- 事件通过 `EventBus -> TuiEvent(Message)` 投递；不要在 EventBus Handler 中做慢渲染或阻塞调用。
+- 审批使用 `TuiApprover` + `ApprovalScreen`；参数必须经 `container.redactor` 脱敏；不得增加 Auto Approve 快捷键。
+- Run/Job 都必须登记为 `_run_task`/`_job_task`；退出时取消并等待 Runtime 清理，再 `Container.close()`。
+- TUI 测试使用 `App.run_test()` headless，不要依赖真实终端；覆盖 streaming、tool、approval、cancel、plan、exit。
+- 新增交互命令时同时更新 `docs/TUI.md` 与 `bear tui --help`/`/help`。
+
 ## 添加 Provider
 
 1. 实现 `ModelProvider.stream()`，返回 `ModelEvent` 异步生成器（`TextDelta`、`ToolCallStart`、`ToolCallArgumentsDelta`、`UsageEvent`、`FinishEvent`）。

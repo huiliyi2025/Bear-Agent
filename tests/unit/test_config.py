@@ -84,9 +84,19 @@ def test_missing_provider_is_config_error(tmp_path: Path, monkeypatch: pytest.Mo
 def test_default_provider_when_no_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     _clear_env(monkeypatch)
     monkeypatch.setenv("BEAR_API_KEY", "from-env")
-    settings = load_settings(tmp_path / "missing.toml")
+    empty = tmp_path / "empty.toml"
+    empty.write_text("", encoding="utf-8")
+    settings = load_settings(empty)
     assert settings.agent.default_provider == "default"
     assert settings.provider().resolve_api_key() == "from-env"
+
+
+def test_explicit_missing_config_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _clear_env(monkeypatch)
+    with pytest.raises(ConfigError, match="does not exist"):
+        load_settings(tmp_path / "missing.toml")
 
 
 def test_write_default_config(tmp_path: Path) -> None:

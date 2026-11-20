@@ -1,6 +1,6 @@
 # 架构
 
-> 状态：阶段 6（Observability / Trace / Metrics / Diagnostics / Benchmark）。本文描述当前已经实现的能力，以及后续阶段必须遵守的边界。
+> 状态：阶段 7（Interactive UX / TUI / Release Readiness）。本文描述当前已经实现的能力，以及后续阶段必须遵守的边界。
 
 ## 目标
 
@@ -11,7 +11,7 @@ Bear-Agent 是本地优先的 Agent Harness，具备四项不可妥协的属性�
 3. **执行层安全**——权限与路径边界由代码强制执行，而不是依赖 Prompt 请求模型遵守。
 4. **可替换的边缘**——模型、存储、工具与 UI 都是端口/适配器。
 
-阶段 6 的非目标：托管多租户服务、分布式 Worker、图形化工作流编排器、模型训练。
+阶段 7 的非目标：托管多租户服务、分布式 Worker、图形化工作流编排器、模型训练。
 
 ## 分层
 
@@ -131,7 +131,8 @@ CLI / run 命令
 | `observability` | 事件总线、记录器、持久化/瞬态事件策略、Trace、Metrics、Live Registry | 改变运行行为或参与安全决策 |
 | `diagnostics` | 结构化静态/主动诊断、报告导出 | 默认执行外部命令/模型调用 |
 | `benchmarks` | 场景、Runner、统计、结果存储与比较 | 评估 Agent 输出质量 |
-| `ui/cli` | Typer 命令、Rich 渲染、审批提示 | Agent Loop 逻辑 |
+| `ui/cli` | Typer 命令、Rich 渲染、经典 chat 与审批提示 | Agent Loop 逻辑 |
+| `ui/tui` | Textual 全屏界面、EventBus 呈现、交互审批、Session 切换 | 第二套 Runtime/安全策略 |
 
 ## 消息模型
 

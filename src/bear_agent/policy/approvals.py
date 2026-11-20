@@ -78,6 +78,12 @@ class ApprovalService:
                 ApprovalScope.DENY,
                 decision.reason or "approval denied",
             )
+        if decision.scope not in request.scope_options:
+            return ApprovalDecision(
+                False,
+                ApprovalScope.DENY,
+                "approver returned a scope that was not offered",
+            )
         scope = decision.scope
         if scope == ApprovalScope.PROJECT and not request.project_id:
             scope = ApprovalScope.SESSION

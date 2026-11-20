@@ -14,7 +14,7 @@ name = "Example MCP server"
 version = "0.1.0"
 description = "Demonstrates a manifest-only plugin that contributes one stdio MCP server."
 author = "Bear-Agent examples"
-requires_bear = ">=0.4.0,<0.7.0"
+requires_bear = ">=0.4.0,<0.8.0"
 homepage = "https://example.invalid/bear-agent/plugins/example_mcp"
 
 # Not loaded unless the user enables it with `bear plugin enable example_mcp`

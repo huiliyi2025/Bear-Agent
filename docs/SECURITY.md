@@ -1,6 +1,6 @@
 # 安全
 
-> 阶段 6 范围。本文说明当前已经强制实施的控制，以及尚未实现的控制。
+> 阶段 7 范围。本文说明当前已经强制实施的控制，以及尚未实现的控制。
 > 不要把推迟项当作已实现。
 
 ## 威胁模型
@@ -19,7 +19,7 @@ Bear-Agent 假设模型可能出错、被操纵，甚至主动对抗：
 
 **信任边界是运行时，不是 Prompt。**
 
-## 已实施控制（阶段 6）
+## 已实施控制（阶段 7）
 
 ### 权限模式与审批
 
@@ -186,6 +186,15 @@ Bear-Agent 假设模型可能出错、被操纵，甚至主动对抗：
 - 实际使用的 provider/model 记录到 Model Call 和事件，避免追溯错误。
 - invalid_request 不重试/不切换；context_length 只切到更大 context 的 route。
 
+### TUI（阶段 7）
+
+- TUI 只呈现/控制现有 Container；所有 Agent 请求仍经 Runtime、ToolExecutor、PermissionEngine、ApprovalService、Claim、Audit、Sandbox 与 Lease/Fencing。
+- 审批 Modal 显示已脱敏的 Tool 名称、Risk、原因与参数；支持 once/session/project/deny；没有 Auto Approve 快捷键；pending 审批在退出时拒绝。
+- TUI 不直接执行 Shell/MCP/Plugin 代码；MCP 调用仍经过 ToolExecutor 与审批。
+- `Ctrl+C`/`/cancel` 调用 Runtime 取消；`Ctrl+Q`/`/exit` 等待 Run/Job 取消与 Container.close，停止 MCP/Plugin，关闭 Trace/DB。退出不会自动重试有副作用的任务。
+- EventBus 到 UI 的投递通过 Textual Message；渲染/UI 故障不会阻塞或改变安全决策。
+- TUI 默认不在非 TTY 启动；CI/管道使用 `run`/`chat`/`--json`。
+
 ### Trace / Metrics / Diagnostics / Benchmark
 
 - Trace 是诊断观察者，不是安全记录，也不参与权限、审批、Claim、Fencing、审计或恢复决策。
@@ -230,7 +239,7 @@ Hardening 后的残余风险：
 - keyring set/get 通过后端选择/拒绝逻辑测试；当前测试环境没有写入用户真实 Credential Manager。
 - macOS Seatbelt profile/deny 规则有单元测试，但当前环境未验证实际执行。
 
-### 阶段 6 残余风险
+### 阶段 7 残余风险
 
 - Trace 属性由调用点约定；新增 instrumentation 必须继续只记录元数据，代码审查与导出清洗是防线。
 - Trace 数据保留在本地 SQLite；拥有数据库读写权限者可读取全部 Trace/事件元数据。无静态加密、无外部完整性锚点。
@@ -239,6 +248,8 @@ Hardening 后的残余风险：
 - 成本估算依赖用户配置与 Provider 语义差异（缓存计价、四舍五入）；不是账单。
 - Benchmark 为单机短样本，不代表生产负载；真实 Provider 结果受网络/模型版本/价格影响。
 - Diagnostics `--active` 会执行 trusted MCP 命令并发送计费请求，必须由用户显式选择。
+- TUI 的取消/退出依赖 Runtime/Sandbox 清理；逃逸 OS 进程树的子进程仍需系统工具处理。
+- TUI 是终端 UI，不提供额外隔离；macOS Seatbelt 仅 CI profile 单元测试，未验证真实执行。
 - macOS Seatbelt 与真实第三方 Provider 未在本机验证。
 
 ### 阶段 5 残余风险

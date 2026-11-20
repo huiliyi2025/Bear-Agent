@@ -13,8 +13,8 @@
 | P4 | 持久化 Task / Plan / Todo 引擎 | **已完成** |
 | P5 | Hooks、插件、MCP、Provider Fallback | **已完成** |
 | P6 | 可观测性、Trace、Metrics、Diagnostics、Benchmark | **已完成** |
-| P7 | TUI、打包、发布工程 | 下一阶段 |
-| P8 | Server/Web UI、多会话、子代理 | 可选 |
+| P7 | TUI、打包、发布工程 | **已完成** |
+| P8 | Server/Web UI、多会话、子代理 | 可选（未开始） |
 
 ---
 
@@ -60,7 +60,7 @@
 - 无 Task/Plan/Todo 引擎；Loop 仍以单次请求为中心（P4）。
 - 无 Hooks/MCP/插件（P5）。
 - ~~无 Trace / Metrics / Benchmark~~——已在 P6 交付；全屏 Trace UI 与 Eval 套件仍属后续阶段。
-- TUI 是流式 CLI，不是全屏应用（P7）。
+- ~~TUI 是流式 CLI~~——P7 已交付 Textual 全屏 TUI；经典流式 chat 仍保留。
 - Provider 在流式模式下不返回 usage 时，用量可能为 0。
 
 ## P2——Shell 执行与执行安全（已完成）
@@ -294,11 +294,28 @@
 - Benchmark 是单机短样本，不代表生产吞吐或统计显著性；真实 Provider 结果受网络/模型版本/价格影响。
 - macOS Seatbelt 与真实第三方 Provider 未在本机验证；GitHub Actions 多平台结果见完成报告。
 
-## P7——UX 与分发
+## P7——Interactive UX / TUI / Release Readiness（已完成）
 
-- 全屏 TUI（prompt_toolkit/Textual）、Plan/Todo 面板、Diff 预览。
-- 安装器（`uv tool`、wheel）、发布流程、升级/迁移。
-- 完整用户、Provider、工具与安全指南。
+> 完成报告：[P7-COMPLETION-REPORT.md](P7-COMPLETION-REPORT.md)。
+
+### 已交付
+
+- Textual 全屏 TUI：Transcript、流式响应、Tool 状态/耗时、Plan/Task/Todo 侧栏、Context/Checkpoint、Provider route、MCP/Plugin/Hook 状态。
+- 完整审批 Modal：显示已脱敏 Tool 参数、风险、原因；once/session/project/deny；TUI 不自动批准。
+- Run 取消、退出清理、Session 新建/切换/恢复/Fork、Plan 生成/执行/取消、Compaction、Anchor、Checkpoint、Metrics、Trace、Doctor。
+- TUI 通过 EventBus 驱动，不阻塞 Runtime/Tool/Async；不建立第二套执行链。
+- `bear` 在真实终端进入 TUI，非 TTY 回退 chat；显式 `bear tui`。
+- 发布工程：版本 0.7.0、`uv build`、隔离安装验证、CLI/TUI Help、Doctor、Session/Run/Tool/Task/MCP/Trace/Metrics/Benchmark smoke。
+- 文档：TUI、CLI、Troubleshooting、Release、Quickstart、Security/架构/ADR/Changelog/Roadmap。
+- 测试：TUI 基础交互/流式/Tool/审批/取消/退出清理/Plan/Metrics；CLI 回归；跨平台本地验证。
+
+### 已知限制
+
+- TUI 是终端界面，不是 Web/图形 IDE；Diff 预览、鼠标布局不在本阶段。
+- macOS Seatbelt 仅 CI 覆盖 profile 构造/单元测试，未验证真实 `sandbox-exec` 执行；Windows 仍无文件系统隔离。
+- TUI 退出依赖 Runtime/Sandbox 的进程清理语义；逃逸 OS 进程树的子进程仍需系统工具处理。
+- Plugin Python/外部 Hook 不是沙箱；MCP 子进程不受 Bear Sandbox/Recovery 管理。
+- 真实第三方 Provider 兼容性与 macOS 实机验证仍需发布后继续观察。
 
 ## P8——可选
 

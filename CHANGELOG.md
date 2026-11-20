@@ -2,6 +2,35 @@
 
 记录所有重要变更。项目按阶段路线图推进；公开版本发布后使用语义化版本。
 
+## [0.7.0] — 2026-11-20 — 阶段 7：Interactive UX / TUI / Release Readiness
+
+### 新增
+
+- Textual 全屏 TUI（`bear tui`；真实终端直接 `bear`）：Transcript、流式响应、Tool 状态/耗时、Plan/Task/Todo 侧栏、Context/Checkpoint、Provider route、MCP/Plugin/Hook 状态。
+- 完整审批 Modal：显示已脱敏 Tool 参数、Risk、原因，支持 once/session/project/deny；无自动批准；退出时 pending 审批安全拒绝。
+- Run 取消/退出清理：`Ctrl+C`/`/cancel` 取消 Runtime，`Ctrl+Q`/`/exit` 停止 Job、取消 Run、等待清理、停止 MCP/Plugin、关闭 Trace/DB。
+- Session 新建/切换/恢复/Fork；Plan 生成/执行/取消；Compaction、Anchor、Checkpoint、Metrics、Trace、Doctor 交互命令。
+- EventBus -> Textual Message 异步呈现；不阻塞 Runtime/Tool/审批；不建立第二套执行链。
+- 真实终端启动 TUI，非 TTY 自动回退经典 `chat`；显式 `bear tui`。
+- 版本 0.7.0、隔离 wheel 安装验证、TUI/CLI 帮助、Doctor、Session/Run/Tool/Task/MCP/Trace/Metrics/Benchmark smoke。
+- 文档：`docs/TUI.md`、`docs/CLI.md`、`docs/TROUBLESHOOTING.md`、`docs/RELEASE.md`、P7 完成报告；README/Architecture/Security/Roadmap/Changelog 更新。
+- 测试：TUI 基础交互、流式、Tool、审批（含参数脱敏）、取消、退出清理、Plan/Metrics；CLI JSON 纯输出回归。
+
+### 安全
+
+- TUI 审批只调用既有 ApprovalService；完整参数经 Redactor 后展示；不提供 Auto Approve 快捷键。
+- 取消/退出不绕过 Runtime 的 Claim、Lease、Audit、Sandbox 清理；待处理审批在退出时拒绝。
+- TUI 不直接执行 Tool/MCP；所有副作用仍经过 ToolExecutor/PermissionEngine/Approval/Claim/Audit/Sandbox。
+- 新增 Textual 依赖（`textual>=0.89,<1`），无其他 UI 重依赖。
+
+### 已知限制
+
+- TUI 不是 Web/图形 IDE；Diff 预览、鼠标布局不在本阶段。
+- macOS Seatbelt 仅 CI 覆盖 profile 构造/单元测试，未验证真实 `sandbox-exec` 执行；Windows 仍无文件系统隔离。
+- Shell 子进程若逃逸 OS 进程树，仍需系统工具处理；TUI 清理依赖 Runtime/Sandbox 现有语义。
+- Plugin Python/外部 Hook 不是沙箱；MCP 子进程不受 Bear Sandbox/Recovery 管理。
+- 真实第三方 Provider 兼容性仍受网络/模型版本/价格影响。
+
 ## [0.6.0] — 2026-11-20 — 阶段 6：Observability / Trace / Metrics / Benchmark
 
 ### 新增

@@ -13,17 +13,29 @@ from bear_agent.policy.models import (
     ApprovalRequest,
     ApprovalScope,
 )
+from bear_agent.secrets.redaction import SecretRedactor
 
 
 class CliApprover:
-    def __init__(self, console: Console | None = None) -> None:
+    def __init__(
+        self,
+        console: Console | None = None,
+        redactor: SecretRedactor | None = None,
+    ) -> None:
         self.console = console or Console()
+        self.redactor = redactor or SecretRedactor()
 
     async def request(self, request: ApprovalRequest) -> ApprovalDecision:
         return await asyncio.to_thread(self._ask, request)
 
     def _ask(self, request: ApprovalRequest) -> ApprovalDecision:
-        arguments = json.dumps(request.arguments, ensure_ascii=False, indent=2, default=str)
+        arguments = json.dumps(
+            self.redactor.redact_obj(request.arguments),
+            ensure_ascii=False,
+            indent=2,
+            default=str,
+        )
+        reason = self.redactor.redact(request.reason)
         if len(arguments) > 3000:
             arguments = arguments[:3000] + "\n... [truncated]"
         project_hint = (
@@ -34,7 +46,7 @@ class CliApprover:
         self.console.print(
             Panel(
                 f"[bold]{request.tool_name}[/bold]\n"
-                f"[dim]risk={request.risk} · {request.reason}[/dim]\n\n{arguments}\n\n"
+                f"[dim]risk={request.risk} · {reason}[/dim]\n\n{arguments}\n\n"
                 "Allow:\n"
                 "  [o]nce\n"
                 "  [s]ession (same exact call in this session)\n"

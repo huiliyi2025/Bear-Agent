@@ -93,6 +93,7 @@ def _configure_stdout_utf8() -> None:
 
 _configure_stdout_utf8()
 console = Console()
+error_console = Console(stderr=True)
 app = typer.Typer(
     add_completion=False,
     no_args_is_help=False,
@@ -173,7 +174,7 @@ def _load(
 
 def _fail(message: str, *, code: int = 1) -> NoReturn:
     message = SecretRedactor().redact(message)
-    console.print(f"[red]error:[/red] {message}", highlight=False)
+    error_console.print(f"[red]error:[/red] {message}", highlight=False)
     raise typer.Exit(code=code)
 
 
@@ -183,6 +184,28 @@ def _make_approver(*, interactive: bool, yes: bool) -> Any:
     if interactive:
         return CliApprover(console)
     return DenyingApprover()
+
+
+def _interactive_terminal() -> bool:
+    """True only for a real terminal on both input and output.
+
+    Test runners and redirected shells can expose an ``isatty``-like stdin
+    without a usable terminal; requiring real file descriptors keeps the root
+    command deterministic and keeps TUI mode out of pipelines.
+    """
+    try:
+        if not (sys.stdin.isatty() and sys.stdout.isatty()):
+            return False
+        if os.name == "nt":
+            return True
+        return os.isatty(sys.stdin.fileno()) and os.isatty(sys.stdout.fileno())
+    except (AttributeError, OSError, ValueError):
+        return False
+
+
+def _attach_approver_redactor(container: Container) -> None:
+    if isinstance(container.approver, CliApprover):
+        container.approver.redactor = container.redactor
 
 
 def _resolve_cwd(cwd: Path | None) -> Path:
@@ -266,6 +289,95 @@ HELP = """\
 
 
 @app.command()
+def tui(
+    config: Path | None = typer.Option(None, "--config", help="Config TOML path."),
+    cwd: Path | None = typer.Option(None, "--cwd", "-C", help="Workspace directory."),
+    provider: str | None = typer.Option(None, "--provider", help="Provider name."),
+    model: str | None = typer.Option(None, "--model", help="Model id."),
+    base_url: str | None = typer.Option(None, "--base-url", help="OpenAI-compatible URL."),
+    api_key: str | None = typer.Option(None, "--api-key", help="API key (prefer env)."),
+    permission: str | None = typer.Option(None, "--permission", help="Permission mode."),
+    max_turns: int | None = typer.Option(None, "--max-turns", help="Turn budget."),
+    resume: str | None = typer.Option(None, "--resume", "-r", help="Resume session id."),
+    continue_latest: bool = typer.Option(
+        False, "--continue", "-c", help="Resume the latest session for this cwd."
+    ),
+) -> None:
+    """启动交互式 TUI (需要真实终端)。"""
+    if not _interactive_terminal():
+        _fail(
+            "Bear-Agent TUI requires an interactive terminal; use `bear run` or `bear chat`", code=2
+        )
+    settings = _load(
+        config=config,
+        base_url=base_url,
+        api_key=api_key,
+        provider=provider,
+        model=model,
+        permission=permission,
+        max_turns=max_turns,
+    )
+    workspace = _resolve_cwd(cwd)
+    try:
+        asyncio.run(
+            _tui(
+                settings,
+                workspace,
+                resume=resume,
+                continue_latest=continue_latest,
+            )
+        )
+    except KeyboardInterrupt:
+        console.print("\n[dim]bye[/dim]")
+
+
+async def _tui(
+    settings: Settings,
+    cwd: Path,
+    *,
+    resume: str | None,
+    continue_latest: bool,
+) -> None:
+    from bear_agent.ui.tui import BearTUI, TuiApprover
+
+    try:
+        settings.validate_ready()
+    except ValueError as exc:
+        _fail(str(exc), code=2)
+    approver = TuiApprover()
+    try:
+        container = build_container(settings, cwd=cwd, approver=approver)
+    except Exception as exc:
+        _fail(f"failed to initialize Bear-Agent: {exc}", code=1)
+        raise AssertionError("unreachable") from exc
+    try:
+        with contextlib.suppress(Exception):
+            await container.secrets.hydrate_redactor()
+        try:
+            await container.startup()
+        except Exception as exc:
+            _fail(f"failed to start extensions: {exc}", code=1)
+        try:
+            session = await _open_session(
+                container, cwd, resume=resume, continue_latest=continue_latest
+            )
+        except BearError as exc:
+            _fail(str(exc), code=2)
+        app = BearTUI(
+            container=container,
+            session=session,
+            settings=settings,
+            workspace=cwd,
+            approver=approver,
+        )
+        await app.run_async()
+        if app.return_code:
+            raise typer.Exit(code=app.return_code)
+    finally:
+        await container.close()
+
+
+@app.command()
 def chat(
     config: Path | None = typer.Option(None, "--config", help="Config TOML path."),
     cwd: Path | None = typer.Option(None, "--cwd", "-C", help="Workspace directory."),
@@ -320,13 +432,16 @@ async def _chat(
         _fail(str(exc), code=2)
     try:
         container = build_container(
-            settings, cwd=cwd, approver=_make_approver(interactive=True, yes=yes)
+            settings,
+            cwd=cwd,
+            approver=_make_approver(interactive=_interactive_terminal(), yes=yes),
         )
     except Exception as exc:
         _fail(f"failed to initialize Bear-Agent: {exc}", code=1)
         raise AssertionError("unreachable") from exc
     with contextlib.suppress(Exception):
         await container.secrets.hydrate_redactor()
+    _attach_approver_redactor(container)
     unsubscribe = container.bus.subscribe(Renderer(console=console))
     try:
         try:
@@ -395,7 +510,7 @@ async def _chat(
                     try:
                         mode = permission_mode(parts[1])
                     except ValueError as exc:
-                        console.print(f"[red]{exc}[/red]")
+                        console.print(f"[red]{container.redactor.redact(str(exc))}[/red]")
                         continue
                     container.policy.set_mode(mode)
                     console.print(f"permission mode: {mode.value}")
@@ -424,7 +539,7 @@ async def _chat(
                     try:
                         epoch = await container.sessions.acquire_lease(session.id, owner, 60.0)
                     except BearError as exc:
-                        console.print(f"[red]{exc}[/red]")
+                        console.print(f"[red]{container.redactor.redact(str(exc))}[/red]")
                         continue
                     fence = LeaseFence(owner, epoch)
                     token = set_fence(fence)
@@ -443,7 +558,7 @@ async def _chat(
                     try:
                         epoch = await container.sessions.acquire_lease(session.id, owner, 900.0)
                     except BearError as exc:
-                        console.print(f"[red]{exc}[/red]")
+                        console.print(f"[red]{container.redactor.redact(str(exc))}[/red]")
                         continue
                     fence = LeaseFence(owner, epoch)
                     token = set_fence(fence)
@@ -457,7 +572,9 @@ async def _chat(
                             turn_index=0,
                         )
                     except Exception as exc:
-                        console.print(f"[red]compaction failed:[/red] {exc}")
+                        console.print(
+                            f"[red]compaction failed:[/red] {container.redactor.redact(str(exc))}"
+                        )
                         continue
                     finally:
                         reset_fence(token)
@@ -485,7 +602,7 @@ async def _chat(
                     try:
                         epoch = await container.sessions.acquire_lease(session.id, owner, 120.0)
                     except BearError as exc:
-                        console.print(f"[red]{exc}[/red]")
+                        console.print(f"[red]{container.redactor.redact(str(exc))}[/red]")
                         continue
                     fence = LeaseFence(owner, epoch)
                     token = set_fence(fence)
@@ -498,7 +615,10 @@ async def _chat(
                                 session.id, draft, source="model", fence=fence
                             )
                         except Exception as exc:
-                            console.print(f"[red]plan generation failed:[/red] {exc}")
+                            console.print(
+                                f"[red]plan generation failed:[/red] "
+                                f"{container.redactor.redact(str(exc))}"
+                            )
                             continue
                         if session.title is None:
                             await container.sessions.set_title(
@@ -520,7 +640,9 @@ async def _chat(
                     try:
                         report = await container.runtime.run_plan(session.id)
                     except BearError as exc:
-                        console.print(f"[red]plan run failed:[/red] {exc}")
+                        console.print(
+                            f"[red]plan run failed:[/red] {container.redactor.redact(str(exc))}"
+                        )
                         continue
                     await _print_plan(container.tasks, session.id)
                     console.print(
@@ -552,7 +674,7 @@ async def _chat(
                     try:
                         epoch = await container.sessions.acquire_lease(session.id, owner, 60.0)
                     except BearError as exc:
-                        console.print(f"[red]{exc}[/red]")
+                        console.print(f"[red]{container.redactor.redact(str(exc))}[/red]")
                         continue
                     fence = LeaseFence(owner, epoch)
                     token = set_fence(fence)
@@ -590,7 +712,9 @@ async def _chat(
                             if fork_scope is not None:
                                 fork_scope.set_attribute("session_id", forked.session.id)
                     except BearError as exc:
-                        console.print(f"[red]fork failed:[/red] {exc}")
+                        console.print(
+                            f"[red]fork failed:[/red] {container.redactor.redact(str(exc))}"
+                        )
                         continue
                     session = forked.session
                     console.print(
@@ -606,10 +730,15 @@ async def _chat(
                 console.print("\n[yellow]cancelling run...[/yellow]")
                 continue
             except BearError as exc:
-                console.print(f"[red]{type(exc).__name__}:[/red] {exc}")
+                console.print(
+                    f"[red]{type(exc).__name__}:[/red] {container.redactor.redact(str(exc))}"
+                )
                 continue
             except Exception as exc:
-                console.print(f"[red]internal error:[/red] {type(exc).__name__}: {exc}")
+                console.print(
+                    f"[red]internal error:[/red] "
+                    f"{container.redactor.redact(f'{type(exc).__name__}: {exc}')}"
+                )
                 continue
             console.print()
             if result.status != RunStatus.COMPLETED:
@@ -686,6 +815,10 @@ async def _run_once(
         raise AssertionError("unreachable") from exc
     with contextlib.suppress(Exception):
         await container.secrets.hydrate_redactor()
+    _attach_approver_redactor(container)
+    with contextlib.suppress(Exception):
+        await container.secrets.hydrate_redactor()
+    _attach_approver_redactor(container)
     renderer = Renderer(json_mode=json_output, console=console)
     unsubscribe = container.bus.subscribe(renderer)
     try:
@@ -701,7 +834,13 @@ async def _run_once(
         try:
             result = await container.runtime.run(session.id, prompt)
         except BearError as exc:
-            console.print(f"[red]{type(exc).__name__}:[/red] {container.redactor.redact(str(exc))}")
+            message = container.redactor.redact(f"{type(exc).__name__}: {exc}")
+            if json_output:
+                print(
+                    json.dumps({"type": "error", "error": message}, ensure_ascii=False), flush=True
+                )
+            else:
+                console.print(f"[red]{message}[/red]")
             return 1
         renderer.summary(
             result.status.value,
@@ -710,7 +849,14 @@ async def _run_once(
             result.stop_reason,
         )
         if result.error:
-            console.print(f"[red]{container.redactor.redact(result.error)}[/red]")
+            message = container.redactor.redact(result.error)
+            if json_output:
+                print(
+                    json.dumps({"type": "error", "error": message}, ensure_ascii=False),
+                    flush=True,
+                )
+            else:
+                console.print(f"[red]{message}[/red]")
         return 0 if result.status == RunStatus.COMPLETED else 1
     finally:
         unsubscribe()
@@ -1106,20 +1252,29 @@ async def _execute_plan(
     except Exception as exc:
         _fail(f"failed to initialize Bear-Agent: {exc}", code=1)
         raise AssertionError("unreachable") from exc
+    with contextlib.suppress(Exception):
+        await container.secrets.hydrate_redactor()
+    _attach_approver_redactor(container)
     renderer = Renderer(json_mode=json_output, console=console)
     unsubscribe = container.bus.subscribe(renderer)
     try:
         try:
             await container.startup()
         except Exception as exc:
-            console.print(
-                f"[red]failed to start extensions:[/red] {container.redactor.redact(str(exc))}"
-            )
+            message = container.redactor.redact(f"failed to start extensions: {exc}")
+            if json_output:
+                print(json.dumps({"type": "error", "error": message}), flush=True)
+            else:
+                console.print(f"[red]{message}[/red]")
             return 1
         try:
             report = await container.runtime.run_plan(session_id)
         except ValueError as exc:
-            console.print(f"[red]invalid session:[/red] {container.redactor.redact(str(exc))}")
+            message = container.redactor.redact(f"invalid session: {exc}")
+            if json_output:
+                print(json.dumps({"type": "error", "error": message}), flush=True)
+            else:
+                console.print(f"[red]{message}[/red]")
             return 2
         if json_output:
             print(
@@ -1153,7 +1308,11 @@ async def _execute_plan(
         ok = report.status == "completed" or (report.status == "active" and not report.issues)
         return 0 if ok else 1
     except BearError as exc:
-        console.print(f"[red]{type(exc).__name__}:[/red] {container.redactor.redact(str(exc))}")
+        message = container.redactor.redact(f"{type(exc).__name__}: {exc}")
+        if json_output:
+            print(json.dumps({"type": "error", "error": message}), flush=True)
+        else:
+            console.print(f"[red]{message}[/red]")
         return 1
     finally:
         unsubscribe()
@@ -1719,7 +1878,22 @@ def providers_show(
         )
         snapshot = provider.snapshot()
     except BearError as exc:
-        console.print(f"[yellow]provider router unavailable:[/yellow] {exc}")
+        message = SecretRedactor().redact(str(exc))
+        if as_json:
+            console.print_json(
+                json.dumps(
+                    {
+                        "type": "error",
+                        "error": message,
+                        "primary": settings.agent.default_provider,
+                        "model": settings.agent.default_model,
+                        "fallbacks": settings.agent.fallback_models,
+                    },
+                    ensure_ascii=False,
+                )
+            )
+            raise typer.Exit(code=1) from None
+        console.print(f"[yellow]provider router unavailable:[/yellow] {message}")
         console.print(
             f"primary={settings.agent.default_provider}:{settings.agent.default_model} "
             f"fallbacks={settings.agent.fallback_models}"
@@ -1796,7 +1970,8 @@ def providers_test(
                 CancelToken(),
             )
         except Exception as exc:
-            console.print(f"[red]provider test failed:[/red] {type(exc).__name__}: {exc}")
+            message = router.redactor.redact(f"{type(exc).__name__}: {exc}")
+            console.print(f"[red]provider test failed:[/red] {message}")
             for route_status in router.status():
                 console.print(
                     f"  {route_status['provider']}/{route_status['model']}: "
@@ -1809,7 +1984,7 @@ def providers_test(
         console.print(
             f"[green]ok[/green] provider={route[0] if route else '?'} "
             f"model={route[1] if route else '?'} "
-            f"reply={response.text[:80]!r}"
+            f"reply={router.redactor.redact(response.text[:80])!r}"
         )
         return 0
 
@@ -2433,6 +2608,11 @@ def metrics_show(
     export: Path | None = typer.Option(None, "--export"),
 ) -> None:
     """聚合 Runtime、Task、Provider、Tool、Context 与 Recovery 指标。"""
+    known_sections = {"runs", "tasks", "models", "tools", "context", "recovery", "system"}
+    if section != "all" and section not in known_sections:
+        _fail(
+            f"unknown metrics section {section!r}; choose all or {sorted(known_sections)}", code=2
+        )
     settings = _settings_only(config)
     since_dt = _parse_since(since)
     report = _metrics_report(settings, since_dt, session)
@@ -3069,7 +3249,10 @@ def init(
         console.print(f"config already exists: [cyan]{target}[/cyan] (use --force to overwrite)")
         raise typer.Exit(code=0) from None
     console.print(f"created [cyan]{target}[/cyan]")
-    console.print("Next: set your API key env var (e.g. DEEPSEEK_API_KEY), then run `bear`.")
+    console.print(
+        "Next: set your API key env var (e.g. DEEPSEEK_API_KEY), then run "
+        '`bear doctor` and `bear` (TUI) or `bear run "hello"`.'
+    )
 
 
 @app.command()
@@ -3369,23 +3552,50 @@ def root(
     if version:
         console.print(f"bear-agent {__version__}")
         raise typer.Exit()
+    if config is not None and ctx.invoked_subcommand is not None:
+        # Root-level --config applies to the selected subcommand. A subcommand
+        # --config still wins because it is passed explicitly to load_settings.
+        previous_config = os.environ.get("BEAR_CONFIG")
+        os.environ["BEAR_CONFIG"] = str(config)
+
+        def restore_config() -> None:
+            if previous_config is None:
+                os.environ.pop("BEAR_CONFIG", None)
+            else:
+                os.environ["BEAR_CONFIG"] = previous_config
+
+        ctx.call_on_close(restore_config)
     if ctx.invoked_subcommand is None:
         # Calling through Typer's invoke would pass OptionInfo sentinels for
-        # parameters the root callback does not know about. Enter the chat
+        # parameters the root callback does not know about. Enter the
         # implementation directly with explicit defaults instead.
-        chat(
-            config=config,
-            cwd=None,
-            provider=None,
-            model=None,
-            base_url=None,
-            api_key=None,
-            permission=None,
-            max_turns=None,
-            resume=None,
-            continue_latest=False,
-            yes=False,
-        )
+        if _interactive_terminal():
+            tui(
+                config=config,
+                cwd=None,
+                provider=None,
+                model=None,
+                base_url=None,
+                api_key=None,
+                permission=None,
+                max_turns=None,
+                resume=None,
+                continue_latest=False,
+            )
+        else:
+            chat(
+                config=config,
+                cwd=None,
+                provider=None,
+                model=None,
+                base_url=None,
+                api_key=None,
+                permission=None,
+                max_turns=None,
+                resume=None,
+                continue_latest=False,
+                yes=False,
+            )
 
 
 if __name__ == "__main__":

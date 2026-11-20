@@ -217,7 +217,11 @@ def load_settings(
     ``{"agent": {"default_model": "x"}, "providers": {"default": {...}}}``.
     CLI flags are folded into this dict by the caller.
     """
-    path = config_path or Path(_env("BEAR_CONFIG") or default_config_path())
+    env_path = _env("BEAR_CONFIG")
+    explicit_path = config_path is not None or env_path is not None
+    path = config_path or Path(env_path or default_config_path())
+    if explicit_path and not path.is_file():
+        raise ConfigError(f"configuration file does not exist: {path}")
     raw = _read_toml(path)
     if not raw.get("providers"):
         raw["providers"] = {

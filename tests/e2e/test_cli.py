@@ -60,9 +60,20 @@ def test_help_and_version() -> None:
     result = runner.invoke(main.app, ["--help"])
     assert result.exit_code == 0
     assert "run" in result.output
+    assert "tui" in result.output
+    tui_help = runner.invoke(main.app, ["tui", "--help"])
+    assert tui_help.exit_code == 0
+    assert "TUI" in tui_help.output
     result = runner.invoke(main.app, ["--version"])
     assert result.exit_code == 0
     assert "bear-agent" in result.output
+
+
+def test_tui_requires_a_terminal(tmp_path: Path) -> None:
+    runner = CliRunner()
+    result = runner.invoke(main.app, ["tui", "--config", str(_config(tmp_path))])
+    assert result.exit_code == 2
+    assert "interactive terminal" in result.output
 
 
 def test_init_creates_config(tmp_path: Path) -> None:
@@ -367,7 +378,7 @@ schema_version = 1
 id = "demo"
 name = "Demo"
 version = "1.0.0"
-requires_bear = ">=0.4.0,<0.7.0"
+requires_bear = ">=0.4.0,<0.8.0"
 description = "test plugin"
 enabled_by_default = false
 
@@ -505,3 +516,43 @@ data_dir = "{data_dir}"
     assert plain.exit_code == 0, plain.output
     assert "leaky-secret" not in plain.output
     assert "leaky-token" not in plain.output
+
+
+def test_root_config_applies_to_subcommand(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    config = _config(tmp_path)
+    text = config.read_text(encoding="utf-8").replace(
+        'default_model = "fake-model"', 'default_model = "root-model"'
+    )
+    config.write_text(text, encoding="utf-8")
+    runner = CliRunner()
+    result = runner.invoke(main.app, ["--config", str(config), "config", "show", "--json"])
+    assert result.exit_code == 0, result.output
+    data = json.loads(result.output)
+    assert data["agent"]["default_model"] == "root-model"
+
+
+def _config_without_key(tmp_path: Path) -> Path:
+    config = _config(tmp_path)
+    text = config.read_text(encoding="utf-8")
+    text = text.replace('api_key = "test"\n', "")
+    config.write_text(text, encoding="utf-8")
+    return config
+
+
+def test_run_json_preflight_error_is_not_on_stdout(tmp_path: Path) -> None:
+    config = _config_without_key(tmp_path)
+    runner = CliRunner()
+    result = runner.invoke(main.app, ["run", "hello", "--config", str(config), "--json"])
+    assert result.exit_code == 2
+    assert result.stdout.strip() == ""
+    assert "no API key" in result.stderr
+
+
+def test_providers_show_json_error_is_structured(tmp_path: Path) -> None:
+    config = _config_without_key(tmp_path)
+    runner = CliRunner()
+    result = runner.invoke(main.app, ["providers", "show", "--config", str(config), "--json"])
+    assert result.exit_code == 1
+    data = json.loads(result.stdout)
+    assert data["type"] == "error"
+    assert "token" not in json.dumps(data).lower()
