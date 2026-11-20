@@ -375,6 +375,9 @@ class ToolShellScenario(ToolReadScenario):
             if result.is_error:
                 if result.error_kind in {
                     "sandbox_error",
+                    "sandbox_unavailable",
+                    "sandbox_or_spawn_error",
+                    "exec_failure",
                     "policy_denied",
                     "approval_denied",
                     "hook_denied",
