@@ -1,6 +1,6 @@
 [project]
 name = "bear-agent"
-version = "0.3.0"
+version = "0.4.0"
 description = "Bear-Agent——本地优先、可恢复、可扩展的 Agent Harness。"
 readme = "README.md"
 requires-python = ">=3.13"

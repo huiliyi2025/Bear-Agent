@@ -6,7 +6,7 @@ Bear-Agent 把模型变成有边界、可观测的执行者：每次工具调用
 
 ## 当前状态
 
-**阶段 3（上下文压缩、Checkpoint、恢复与 Fork）已完成。** 当前版本支持：
+**阶段 4（Task / Plan / Todo Engine）已完成。** 当前版本支持：
 
 - 在 OpenAI 兼容流式端点上运行异步 Agent Loop；
 - 执行 Shell 命令：超时、输出上限、进程树终止、取消；
@@ -21,9 +21,11 @@ Bear-Agent 把模型变成有边界、可观测的执行者：每次工具调用
 - Checkpoint：不可变、带 checksum 与版本的状态快照，可按数量保留；
 - 崩溃恢复：Lease Epoch Fencing、只读 Transcript 对账、合成“状态未知/未自动重试”的工具结果、清理旧 Claim 与孤儿 Shell 进程；
 - Session Fork：从历史位置或 Checkpoint 派生独立会话，不继承执行状态与审批；
+- 持久化 Task / Plan / Todo：模型生成结构化计划、程序校验依赖/循环、版本化修订、依赖调度；
+- 任务执行接入真实 Runtime：独立完成验证、失败重试、阻塞、取消、恢复与副作用保护；
 - CLI 流式输出文本与工具状态，或输出 NDJSON 给脚本。
 
-暂未实现（见 [ROADMAP.md](docs/ROADMAP.md)）：持久化任务引擎、Hooks、MCP、插件、子代理、完整 TUI。
+暂未实现（见 [ROADMAP.md](docs/ROADMAP.md)）：Hooks、MCP、插件、子代理、完整 TUI。
 
 ## 环境要求
 
@@ -82,6 +84,21 @@ bear sessions fork <session-id> --checkpoint <checkpoint-id>
 ```
 
 交互模式下可使用 `/compact`、`/anchor <text>`、`/anchors`、`/fork [message_seq]`。
+
+任务规划与执行：
+
+```bash
+bear tasks plan "实现并验证一个功能，包含测试与文档"   # 生成并校验 Plan
+bear tasks show <session-id>                          # Plan / Todo / 状态
+bear tasks run <session-id>                           # 执行 Plan
+bear tasks task <task-id>                             # 任务详情与尝试历史
+bear tasks revise <session-id> --file plan.json --reason "..."
+bear tasks retry <task-id> [--force]
+bear tasks resume <session-id> [--run]
+bear tasks cancel <session-id> [--task <task-id>]
+```
+
+交互模式下可使用 `/plan <goal>`、`/tasks`、`/run-plan`、`/task <id>`、`/cancel-plan`。
 
 不修改配置文件，直接覆盖 Provider：
 

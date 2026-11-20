@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import hmac
 import sqlite3
+from collections.abc import Callable
 from datetime import datetime
 from typing import Any
 
@@ -88,6 +89,7 @@ class CheckpointService:
         audit: AuditService | None = None,
         config: CheckpointConfig | None = None,
         redactor: SecretRedactor | None = None,
+        task_snapshot: Callable[[sqlite3.Connection, str], dict[str, Any]] | None = None,
         clock: Clock | None = None,
     ) -> None:
         self.sessions = sessions
@@ -99,6 +101,7 @@ class CheckpointService:
         self.audit = audit
         self.config = config or CheckpointConfig()
         self.redactor = redactor or SecretRedactor()
+        self.task_snapshot = task_snapshot
         self.clock = clock or SystemClock()
 
     # ------------------------------------------------------------------ create
@@ -327,6 +330,9 @@ class CheckpointService:
                     "cache_read_tokens": int(usage_row["cache_read_tokens"]),
                     "cache_write_tokens": int(usage_row["cache_write_tokens"]),
                 },
+                "tasks": (
+                    self.task_snapshot(conn, session_id) if self.task_snapshot is not None else None
+                ),
             }
             # Titles and anchors are user-controlled text; never persist a
             # known secret into a checkpoint state blob or its checksum.
@@ -529,6 +535,18 @@ def _validate_state_shape(record: CheckpointRecord) -> None:
         "cache_write_tokens",
     ):
         _int_field(usage, key, record.id)
+
+    tasks = state.get("tasks")
+    if tasks is not None:
+        if not isinstance(tasks, dict):
+            raise CheckpointCorrupt(f"checkpoint {record.id} has an invalid tasks block")
+        plan = tasks.get("plan")
+        if plan is not None and not isinstance(plan, dict):
+            raise CheckpointCorrupt(f"checkpoint {record.id} has an invalid task plan")
+        if not isinstance(tasks.get("tasks", []), list):
+            raise CheckpointCorrupt(f"checkpoint {record.id} has an invalid task list")
+        if not isinstance(tasks.get("dependencies", {}), dict):
+            raise CheckpointCorrupt(f"checkpoint {record.id} has invalid task dependencies")
 
 
 def _int_field(container: dict[str, Any], key: str, checkpoint_id: str) -> int:

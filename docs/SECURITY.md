@@ -1,6 +1,6 @@
 # 安全
 
-> 阶段 3 范围。本文说明当前已经强制实施的控制，以及尚未实现的控制。
+> 阶段 4 范围。本文说明当前已经强制实施的控制，以及尚未实现的控制。
 > 不要把推迟项当作已实现。
 
 ## 威胁模型
@@ -18,7 +18,7 @@ Bear-Agent 假设模型可能出错、被操纵，甚至主动对抗：
 
 **信任边界是运行时，不是 Prompt。**
 
-## 已实施控制（阶段 3）
+## 已实施控制（阶段 4）
 
 ### 权限模式与审批
 
@@ -139,6 +139,19 @@ Bear-Agent 假设模型可能出错、被操纵，甚至主动对抗：
 - 不继承 tool_calls、model_calls、claims、approvals、processes、checkpoints、compactions、context_state。
 - 新会话必须重新获取 Lease/Claim 与审批；project 作用域审批按既有 project ID 语义仍适用，这是文档化的例外。
 
+### Task / Plan / Todo Engine
+
+- 模型生成的 Plan/修订必须通过 Pydantic 结构校验、唯一 key、依赖存在、无自依赖、无环、Task 数量上限；非法结构不会落库。
+- Task 状态只能由 `TaskService` 在事务中按显式状态机修改；`task_complete` 只写“完成请求”，不改变状态。
+- 完成需要独立验证：evidence 模式要求 summary + evidence；模型模式使用独立 verifier 调用，失败/异常 fail-closed 为 blocked。
+- 所有 Task 写入在同一事务内校验 Session Lease owner/epoch/expiry；Plan 执行期间整个循环持有同一 fence。
+- 任务失败时检查该 run 是否执行过非幂等工具；执行过则**不自动重试**，Task 标记 blocked，要求用户检查后显式 retry。崩溃中的 running attempt 也只标记 unknown/blocked，不自动重放。手动 retry/resume 同样检查最后一次 attempt，默认拒绝，必须显式 `--force`。
+- Plan 修订在有 Task in_progress 时被拒绝；修订次数、尝试次数、Task 数、每轮任务数、每任务轮次均有上限。
+- Task 工具通过 ToolExecutor 调用；不绕过 PermissionEngine、Claim、Audit、Sandbox。
+- Task 事件与审计覆盖 Plan 创建/修订、Task 开始/完成/失败/阻塞/取消/重试/验证/恢复。
+- Checkpoint 的 tasks 快照在同一事务读取并脱敏；Fork 不复制 Plan/Task/Attempt，避免继承未经重新验证的完成状态。
+- Task/Plan/Todo 上下文作为 pinned system 块注入，压缩 L1-L4 不会移除。
+
 ### 工具执行
 
 - 执行前进行 JSON Schema 校验；非法参数不会到达工具。
@@ -171,6 +184,15 @@ Hardening 后的残余风险：
 - keyring set/get 通过后端选择/拒绝逻辑测试；当前测试环境没有写入用户真实 Credential Manager。
 - macOS Seatbelt profile/deny 规则有单元测试，但当前环境未验证实际执行。
 
+### 阶段 4 残余风险
+
+- 模型 verifier 仍可能误判任务完成或遗漏验收标准；evidence 模式只检查证据存在，不判断语义质量。
+- 自动重试对读/幂等任务开放；写文件工具标记为幂等，重复执行通常是覆盖同一内容，但不提供跨工具的事务语义。
+- Plan 执行期间长时间持有 Session Lease；崩溃后的任务需要显式 resume/retry。
+- Transcript 累积每个任务的 prompt/结果；超长 Plan 依赖压缩，可能丢失早期细节（P3 锚点/摘要缓解）。
+- Fork 不继承任务计划，用户需要重新规划。
+- 任务审计是 best-effort：状态已提交后审计失败只记录日志，不回滚任务状态。
+
 ### 阶段 3 残余风险
 
 - L3 模型摘要仍可能受到 Prompt Injection 或幻觉影响。压缩不会改变权限、审批或工具目录，但摘要可能丢失/扭曲事实；Anchor Ledger 与 L2 确定性摘要用于降低风险。
@@ -186,7 +208,7 @@ Hardening 后的残余风险：
 |---|---|---|
 | Windows 文件系统隔离（AppContainer/restricted token） | 后续 | 已评估但未交付；Windows Job Object 仅进程级，`require` 默认阻止 Shell |
 | MCP 信任与能力策略 | P5 | MCP 尚未实现 |
-| Prompt Injection 污点追踪 | P5 | 不可信输出未作为数据流追踪；压缩 prompt 仅做边界声明 |
+| Prompt Injection 污点追踪 | P5 | 不可信输出未作为数据流追踪；压缩/规划/验证 prompt 仅做边界声明 |
 | 外部审计锚点/签名 | 后续 | 本地哈希链可被数据库写者重算 |
 | 静态加密数据库 | 后续 | SQLite 在磁盘上为明文 |
 | 逐命令网络策略 | 后续 | Sandbox 网络是会话级全开/全关 |

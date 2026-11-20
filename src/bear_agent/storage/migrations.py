@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import sqlite3
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 
 SCHEMA_V1 = """
@@ -256,6 +256,101 @@ def _add_column_if_missing(
     conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {sql_type}")
 
 
+SCHEMA_V5 = """
+CREATE TABLE IF NOT EXISTS plans (
+    id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL UNIQUE REFERENCES sessions(id) ON DELETE CASCADE,
+    goal TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (
+        status IN ('draft', 'active', 'completed', 'failed', 'blocked', 'cancelled')
+    ),
+    version INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS plan_revisions (
+    id TEXT PRIMARY KEY,
+    plan_id TEXT NOT NULL REFERENCES plans(id) ON DELETE CASCADE,
+    session_id TEXT NOT NULL,
+    version INTEGER NOT NULL,
+    goal TEXT NOT NULL,
+    reason TEXT,
+    source TEXT NOT NULL CHECK (source IN ('model', 'user', 'system')),
+    snapshot_json TEXT NOT NULL,
+    created_by_run_id TEXT,
+    created_at TEXT NOT NULL,
+    UNIQUE (plan_id, version)
+);
+CREATE INDEX IF NOT EXISTS idx_plan_revisions_plan
+    ON plan_revisions (plan_id, version DESC);
+
+CREATE TABLE IF NOT EXISTS tasks (
+    id TEXT PRIMARY KEY,
+    plan_id TEXT NOT NULL REFERENCES plans(id) ON DELETE CASCADE,
+    session_id TEXT NOT NULL,
+    task_key TEXT NOT NULL,
+    title TEXT NOT NULL,
+    description TEXT NOT NULL,
+    acceptance_criteria TEXT,
+    status TEXT NOT NULL CHECK (
+        status IN ('pending', 'in_progress', 'completed', 'failed', 'blocked', 'cancelled', 'skipped')
+    ),
+    priority INTEGER NOT NULL DEFAULT 0,
+    order_index INTEGER NOT NULL DEFAULT 0,
+    attempt_count INTEGER NOT NULL DEFAULT 0,
+    max_attempts INTEGER NOT NULL DEFAULT 3,
+    verification TEXT NOT NULL DEFAULT 'model' CHECK (verification IN ('model', 'evidence')),
+    active INTEGER NOT NULL DEFAULT 1,
+    result_summary TEXT,
+    last_error TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    started_at TEXT,
+    finished_at TEXT,
+    metadata_json TEXT,
+    UNIQUE (plan_id, task_key)
+);
+CREATE INDEX IF NOT EXISTS idx_tasks_plan_status
+    ON tasks (plan_id, active, status, priority DESC, order_index);
+CREATE INDEX IF NOT EXISTS idx_tasks_session
+    ON tasks (session_id, status);
+
+CREATE TABLE IF NOT EXISTS task_dependencies (
+    plan_id TEXT NOT NULL,
+    task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    depends_on_task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    PRIMARY KEY (task_id, depends_on_task_id)
+);
+CREATE INDEX IF NOT EXISTS idx_task_dependencies_dep
+    ON task_dependencies (depends_on_task_id);
+
+CREATE TABLE IF NOT EXISTS task_attempts (
+    id TEXT PRIMARY KEY,
+    task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    session_id TEXT NOT NULL,
+    attempt_no INTEGER NOT NULL,
+    run_id TEXT,
+    status TEXT NOT NULL CHECK (
+        status IN ('running', 'completed', 'failed', 'blocked', 'cancelled', 'unknown')
+    ),
+    started_at TEXT NOT NULL,
+    finished_at TEXT,
+    completion_summary TEXT,
+    evidence_json TEXT,
+    verification_json TEXT,
+    error_kind TEXT,
+    error_message TEXT,
+    metadata_json TEXT,
+    UNIQUE (task_id, attempt_no)
+);
+CREATE INDEX IF NOT EXISTS idx_task_attempts_task
+    ON task_attempts (task_id, attempt_no DESC);
+CREATE INDEX IF NOT EXISTS idx_task_attempts_session
+    ON task_attempts (session_id, status);
+"""
+
+
 def migrate(conn: sqlite3.Connection) -> None:
     conn.execute("CREATE TABLE IF NOT EXISTS schema_meta (version INTEGER NOT NULL)")
     row = conn.execute("SELECT version FROM schema_meta LIMIT 1").fetchone()
@@ -284,4 +379,8 @@ def migrate(conn: sqlite3.Connection) -> None:
     if version < 4:
         conn.executescript(SCHEMA_V4)
         conn.execute("UPDATE schema_meta SET version = 4")
+        version = 4
+    if version < 5:
+        conn.executescript(SCHEMA_V5)
+        conn.execute("UPDATE schema_meta SET version = 5")
     conn.commit()

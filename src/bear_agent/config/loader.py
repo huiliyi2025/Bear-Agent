@@ -99,6 +99,20 @@ enabled = true
 kill_orphan_processes = true
 require_audit = true
 
+[tasks]
+enabled = true
+max_tasks = 50               # 单个 Plan 的最大任务数
+max_attempts = 3             # 每个任务的最大尝试次数
+max_revisions = 10           # 每个 Plan 的最大修订次数
+max_tasks_per_run = 50       # 一次 Plan 执行最多处理的任务数
+max_task_turns = 20          # 每个任务的模型轮次上限; 0 表示使用 agent.max_turns
+verify_completion = true     # 任务完成必须通过独立验证或证据门槛
+planner_model = ""           # 空表示使用默认模型
+verification_model = ""      # 空表示使用默认模型
+planner_max_retries = 2
+planner_max_output_tokens = 4096
+context_max_tokens = 1200    # 每轮固定注入的 Task/Plan 上下文上限
+
 # Any OpenAI-compatible endpoint works, including Ollama / vLLM / a relay:
 # [providers.local]
 # type = "openai_compat"
@@ -293,6 +307,9 @@ def settings_to_toml(settings: Settings) -> str:
         lines.append(f"{key} = {_toml_value(value)}")
     lines.extend(["", "[recovery]"])
     for key, value in settings.recovery.model_dump().items():
+        lines.append(f"{key} = {_toml_value(value)}")
+    lines.extend(["", "[tasks]"])
+    for key, value in settings.tasks.model_dump().items():
         lines.append(f"{key} = {_toml_value(value)}")
     for name, provider in settings.providers.items():
         lines.append("")

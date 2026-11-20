@@ -13,7 +13,7 @@ import os
 import platform
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, NoReturn
 
 import typer
 from rich.console import Console
@@ -35,7 +35,7 @@ from bear_agent.config.loader import (
     write_default_config,
 )
 from bear_agent.config.models import Settings
-from bear_agent.core.errors import BearError, CheckpointError
+from bear_agent.core.errors import BearError, CheckpointError, TaskStateError
 from bear_agent.core.fencing import LeaseFence, reset_fence, set_fence
 from bear_agent.core.usage import TokenUsage
 from bear_agent.policy.approver import AutoApprover, DenyingApprover
@@ -47,6 +47,8 @@ from bear_agent.sessions.service import SessionService
 from bear_agent.shell.sandbox.base import SandboxManager
 from bear_agent.storage.database import Database
 from bear_agent.storage.security_repositories import SecretNameRepository
+from bear_agent.tasks.models import PlanDraft, TaskStatus
+from bear_agent.tasks.service import TaskService
 from bear_agent.tools.builtin import create_builtin_tools
 from bear_agent.ui.cli.approvals import CliApprover
 from bear_agent.ui.cli.render import Renderer
@@ -73,10 +75,12 @@ app = typer.Typer(
     help="Bear-Agent——本地优先、可恢复、可扩展的 Agent Harness。",
 )
 sessions_app = typer.Typer(help="查看与恢复会话。")
+tasks_app = typer.Typer(help="规划并执行多步骤任务。")
 config_app = typer.Typer(help="查看配置。")
 audit_app = typer.Typer(help="查看安全审计链。")
 secret_app = typer.Typer(help="管理 keyring 密钥。")
 app.add_typer(sessions_app, name="sessions")
+app.add_typer(tasks_app, name="tasks")
 app.add_typer(config_app, name="config")
 app.add_typer(audit_app, name="audit")
 app.add_typer(secret_app, name="secret")
@@ -128,7 +132,7 @@ def _load(
     raise AssertionError("unreachable")
 
 
-def _fail(message: str, *, code: int = 1) -> None:
+def _fail(message: str, *, code: int = 1) -> NoReturn:
     message = SecretRedactor().redact(message)
     console.print(f"[red]error:[/red] {message}", highlight=False)
     raise typer.Exit(code=code)
@@ -209,6 +213,11 @@ HELP = """\
 /anchor <text>        pin a fact that compaction must keep
 /anchors              list active anchors
 /fork [message_seq]   fork this session at a safe position
+/plan <goal>          generate a structured plan for a complex goal
+/tasks                show plan, todo and task status
+/run-plan             execute the active plan
+/task <task_id>       show one task and its attempts
+/cancel-plan          cancel the active plan and unfinished tasks
 /exit                 quit
 """
 
@@ -372,7 +381,7 @@ async def _chat(
                 if text == "/compact":
                     owner = f"cli-{os.getpid()}"
                     try:
-                        epoch = await container.sessions.acquire_lease(session.id, owner, 120.0)
+                        epoch = await container.sessions.acquire_lease(session.id, owner, 900.0)
                     except BearError as exc:
                         console.print(f"[red]{exc}[/red]")
                         continue
@@ -400,6 +409,102 @@ async def _chat(
                     )
                     for note in prepared.notes:
                         console.print(f"  [dim]{note}[/dim]")
+                    continue
+                if text == "/tasks":
+                    await _print_plan(container.tasks, session.id, attempts=True)
+                    continue
+                if text.startswith("/plan "):
+                    goal = text[len("/plan ") :].strip()
+                    if not goal:
+                        console.print("usage: /plan <goal>")
+                        continue
+                    if await container.tasks.get_plan(session.id) is not None:
+                        console.print("this session already has a plan; use /tasks")
+                        continue
+                    owner = f"cli-{os.getpid()}"
+                    try:
+                        epoch = await container.sessions.acquire_lease(session.id, owner, 120.0)
+                    except BearError as exc:
+                        console.print(f"[red]{exc}[/red]")
+                        continue
+                    fence = LeaseFence(owner, epoch)
+                    token = set_fence(fence)
+                    try:
+                        try:
+                            draft = await container.planner.generate(
+                                goal, context=f"Workspace: {cwd}"
+                            )
+                            created = await container.tasks.create_plan(
+                                session.id, draft, source="model", fence=fence
+                            )
+                        except Exception as exc:
+                            console.print(f"[red]plan generation failed:[/red] {exc}")
+                            continue
+                        if session.title is None:
+                            await container.sessions.set_title(
+                                session.id,
+                                " ".join(goal.split())[:80] or "Task plan",
+                                fence=fence,
+                            )
+                    finally:
+                        reset_fence(token)
+                        with contextlib.suppress(Exception):
+                            await container.sessions.release_lease(session.id, owner, epoch)
+                    console.print(
+                        f"plan [cyan]{created.id}[/cyan] v{created.version} "
+                        f"with {len(draft.tasks)} task(s)"
+                    )
+                    await _print_plan(container.tasks, session.id)
+                    continue
+                if text == "/run-plan":
+                    try:
+                        report = await container.runtime.run_plan(session.id)
+                    except BearError as exc:
+                        console.print(f"[red]plan run failed:[/red] {exc}")
+                        continue
+                    await _print_plan(container.tasks, session.id)
+                    console.print(
+                        f"[bold]{report.status}[/bold] | run={report.tasks_run} "
+                        f"completed={report.tasks_completed} failed={report.tasks_failed} "
+                        f"blocked={report.tasks_blocked} revisions={report.revisions}"
+                    )
+                    for issue in report.issues:
+                        console.print(f"[yellow]issue:[/yellow] {issue}")
+                    continue
+                if text.startswith("/task "):
+                    task_id = text[len("/task ") :].strip()
+                    task = await container.tasks.get_task(task_id)
+                    if task is None:
+                        console.print(f"[red]task not found:[/red] {task_id}")
+                        continue
+                    deps = await container.tasks.dependencies(task_id)
+                    console.print(
+                        f"[cyan]{task.task_key}[/cyan] {task.title}\n"
+                        f"status={task.status.value} attempts={task.attempt_count}/"
+                        f"{task.max_attempts} deps={', '.join(deps) or '(none)'}\n"
+                        f"acceptance: {task.acceptance_criteria or '(none)'}\n"
+                        f"result: {task.result_summary or '(none)'}\n"
+                        f"last error: {task.last_error or '(none)'}"
+                    )
+                    continue
+                if text == "/cancel-plan":
+                    owner = f"cli-{os.getpid()}"
+                    try:
+                        epoch = await container.sessions.acquire_lease(session.id, owner, 60.0)
+                    except BearError as exc:
+                        console.print(f"[red]{exc}[/red]")
+                        continue
+                    fence = LeaseFence(owner, epoch)
+                    token = set_fence(fence)
+                    try:
+                        plan = await container.tasks.cancel_plan(
+                            session.id, reason="cancelled by user", fence=fence
+                        )
+                    finally:
+                        reset_fence(token)
+                        with contextlib.suppress(Exception):
+                            await container.sessions.release_lease(session.id, owner, epoch)
+                    console.print("plan cancelled" if plan else "no plan to cancel")
                     continue
                 if text == "/fork" or text.startswith("/fork "):
                     at: int | None = None
@@ -831,6 +936,590 @@ def sessions_checkpoints(
         _fail(str(exc), code=2)
     except Exception as exc:
         _fail(f"cannot list checkpoints: {exc}", code=1)
+
+
+# ----------------------------------------------------------------------- tasks
+
+
+async def _print_plan(tasks: TaskService, session_id: str, *, attempts: bool = False) -> None:
+    plan = await tasks.get_plan(session_id)
+    if plan is None:
+        console.print("[yellow]no plan for this session[/yellow]")
+        return
+    console.print(
+        Panel(
+            f"plan     [dim]{plan.id}[/dim]\n"
+            f"version  v{plan.version}\n"
+            f"status   {plan.status.value}\n"
+            f"goal     {plan.goal}",
+            title="Plan",
+            border_style="cyan",
+        )
+    )
+    todo = await tasks.todo(session_id)
+    table = Table(title="Todo")
+    table.add_column("", width=3)
+    table.add_column("key", style="cyan", no_wrap=True)
+    table.add_column("title")
+    table.add_column("status")
+    table.add_column("deps", style="dim")
+    for item in todo:
+        table.add_row(
+            item.marker,
+            item.key,
+            item.title,
+            item.status.value,
+            ", ".join(item.dependencies),
+        )
+    console.print(table)
+    if attempts:
+        for item in todo:
+            if item.status in {TaskStatus.IN_PROGRESS, TaskStatus.FAILED, TaskStatus.BLOCKED}:
+                history = await tasks.attempts(item.task_id)
+                for attempt in history[-3:]:
+                    console.print(
+                        f"  [dim]{item.key} attempt {attempt.attempt_no}: "
+                        f"{attempt.status.value}"
+                        + (f" — {attempt.error_message}" if attempt.error_message else "")
+                        + "[/dim]"
+                    )
+
+
+async def _execute_plan(
+    settings: Settings,
+    workspace: Path,
+    session_id: str,
+    *,
+    json_output: bool,
+) -> int:
+    if not settings.tasks.enabled:
+        _fail("task engine is disabled in configuration ([tasks].enabled=false)", code=2)
+    try:
+        settings.validate_ready()
+    except ValueError as exc:
+        _fail(str(exc), code=2)
+    try:
+        container = build_container(settings, cwd=workspace)
+    except Exception as exc:
+        _fail(f"failed to initialize Bear-Agent: {exc}", code=1)
+        raise AssertionError("unreachable") from exc
+    renderer = Renderer(json_mode=json_output, console=console)
+    unsubscribe = container.bus.subscribe(renderer)
+    try:
+        try:
+            report = await container.runtime.run_plan(session_id)
+        except ValueError as exc:
+            console.print(f"[red]invalid session:[/red] {container.redactor.redact(str(exc))}")
+            return 2
+        if json_output:
+            print(
+                json.dumps(
+                    {
+                        "type": "plan_result",
+                        "status": report.status,
+                        "plan_id": report.plan_id,
+                        "tasks_run": report.tasks_run,
+                        "tasks_completed": report.tasks_completed,
+                        "tasks_failed": report.tasks_failed,
+                        "tasks_blocked": report.tasks_blocked,
+                        "revisions": report.revisions,
+                        "reason": report.reason,
+                        "issues": report.issues,
+                    },
+                    ensure_ascii=False,
+                ),
+                flush=True,
+            )
+        else:
+            await _print_plan(container.tasks, session_id)
+            console.print(
+                f"[bold]{report.status}[/bold] | tasks run={report.tasks_run} "
+                f"completed={report.tasks_completed} failed={report.tasks_failed} "
+                f"blocked={report.tasks_blocked} revisions={report.revisions}"
+                + (f" | {report.reason}" if report.reason else "")
+            )
+            for issue in report.issues:
+                console.print(f"[yellow]issue:[/yellow] {issue}")
+        ok = report.status == "completed" or (report.status == "active" and not report.issues)
+        return 0 if ok else 1
+    except BearError as exc:
+        console.print(f"[red]{type(exc).__name__}:[/red] {container.redactor.redact(str(exc))}")
+        return 1
+    finally:
+        unsubscribe()
+        await container.close()
+
+
+@tasks_app.command("plan")
+def tasks_plan(
+    goal: str = typer.Argument(..., help="Complex goal to decompose."),
+    config: Path | None = typer.Option(None, "--config"),
+    cwd: Path | None = typer.Option(None, "--cwd", "-C"),
+    session: str | None = typer.Option(None, "--session", "-s", help="Existing session id."),
+    run: bool = typer.Option(False, "--run", help="Execute the plan immediately."),
+    json_output: bool = typer.Option(False, "--json", help="Emit NDJSON events while running."),
+) -> None:
+    """用模型生成结构化 Plan, 经程序校验后持久化."""
+    settings = _load(
+        config=config,
+        base_url=None,
+        api_key=None,
+        provider=None,
+        model=None,
+        permission=None,
+        max_turns=None,
+    )
+    workspace = _resolve_cwd(cwd)
+
+    async def _plan() -> None:
+        if not settings.tasks.enabled:
+            _fail("task engine is disabled in configuration ([tasks].enabled=false)", code=2)
+        try:
+            settings.validate_ready()
+        except ValueError as exc:
+            _fail(str(exc), code=2)
+        try:
+            container = build_container(settings, cwd=workspace)
+        except Exception as exc:
+            _fail(f"failed to initialize Bear-Agent: {exc}", code=1)
+            return
+        try:
+            if session:
+                record = await container.sessions.get(session)
+                if record is None:
+                    _fail(f"session not found: {session}", code=2)
+            else:
+                record = await container.sessions.create(
+                    cwd=workspace,
+                    model=settings.agent.default_model,
+                    provider=settings.agent.default_provider,
+                    title=" ".join(goal.split())[:80] or "Task plan",
+                    publish=container.bus.publish,
+                )
+            if await container.tasks.get_plan(record.id) is not None:
+                _fail("session already has a plan; use tasks show or revise it", code=2)
+            owner = f"cli-plan-{os.getpid()}"
+            epoch = await container.sessions.acquire_lease(record.id, owner, 900.0)
+            fence = LeaseFence(owner, epoch)
+            token = set_fence(fence)
+            try:
+                draft = await container.planner.generate(goal, context=f"Workspace: {workspace}")
+                plan = await container.tasks.create_plan(
+                    record.id, draft, source="model", fence=fence
+                )
+                if record.title is None:
+                    await container.sessions.set_title(
+                        record.id, " ".join(goal.split())[:80] or "Task plan", fence=fence
+                    )
+            finally:
+                reset_fence(token)
+                with contextlib.suppress(Exception):
+                    await container.sessions.release_lease(record.id, owner, epoch)
+            if json_output:
+                print(
+                    json.dumps(
+                        {
+                            "type": "plan_created",
+                            "session_id": record.id,
+                            "plan_id": plan.id,
+                            "version": plan.version,
+                            "tasks": [task.key for task in draft.tasks],
+                        },
+                        ensure_ascii=False,
+                    ),
+                    flush=True,
+                )
+            else:
+                console.print(
+                    f"plan [cyan]{plan.id}[/cyan] created with {len(draft.tasks)} task(s)"
+                )
+                await _print_plan(container.tasks, record.id)
+            if run:
+                await container.close()
+                raise typer.Exit(
+                    code=await _execute_plan(
+                        settings, workspace, record.id, json_output=json_output
+                    )
+                )
+        finally:
+            with contextlib.suppress(Exception):
+                await container.close()
+
+    try:
+        asyncio.run(_plan())
+    except typer.Exit:
+        raise
+    except BearError as exc:
+        _fail(str(exc), code=1)
+    except Exception as exc:
+        _fail(f"plan generation failed: {exc}", code=1)
+
+
+@tasks_app.command("show")
+def tasks_show(
+    session_id: str = typer.Argument(..., help="Session id."),
+    config: Path | None = typer.Option(None, "--config"),
+    attempts: bool = typer.Option(True, "--attempts/--no-attempts"),
+) -> None:
+    """查看当前 Plan、Todo 与执行历史。"""
+    settings = _load(
+        config=config,
+        base_url=None,
+        api_key=None,
+        provider=None,
+        model=None,
+        permission=None,
+        max_turns=None,
+    )
+
+    async def _show() -> None:
+        maintenance = build_maintenance(settings, cwd=Path.cwd())
+        try:
+            record = await maintenance.sessions.get(session_id)
+            if record is None:
+                _fail(f"session not found: {session_id}", code=2)
+            await _print_plan(maintenance.tasks, session_id, attempts=attempts)
+        finally:
+            await maintenance.close()
+
+    try:
+        asyncio.run(_show())
+    except typer.Exit:
+        raise
+    except BearError as exc:
+        _fail(str(exc), code=1)
+    except Exception as exc:
+        _fail(f"cannot show plan: {exc}", code=1)
+
+
+@tasks_app.command("run")
+def tasks_run(
+    session_id: str = typer.Argument(..., help="Session id."),
+    config: Path | None = typer.Option(None, "--config"),
+    cwd: Path | None = typer.Option(None, "--cwd", "-C"),
+    json_output: bool = typer.Option(False, "--json", help="Emit NDJSON events."),
+) -> None:
+    """执行当前 Plan, 直到完成、阻塞或预算耗尽."""
+    settings = _load(
+        config=config,
+        base_url=None,
+        api_key=None,
+        provider=None,
+        model=None,
+        permission=None,
+        max_turns=None,
+    )
+    workspace = _resolve_cwd(cwd)
+    code = asyncio.run(_execute_plan(settings, workspace, session_id, json_output=json_output))
+    raise typer.Exit(code=code)
+
+
+@tasks_app.command("task")
+def tasks_task(
+    task_id: str = typer.Argument(..., help="Task id."),
+    config: Path | None = typer.Option(None, "--config"),
+) -> None:
+    """查看单个任务的详情、依赖与尝试历史。"""
+    settings = _load(
+        config=config,
+        base_url=None,
+        api_key=None,
+        provider=None,
+        model=None,
+        permission=None,
+        max_turns=None,
+    )
+
+    async def _task() -> None:
+        maintenance = build_maintenance(settings, cwd=Path.cwd())
+        try:
+            task = await maintenance.tasks.get_task(task_id)
+            if task is None:
+                _fail(f"task not found: {task_id}", code=2)
+            deps = await maintenance.tasks.dependencies(task_id)
+            console.print(
+                Panel(
+                    f"id           [dim]{task.id}[/dim]\n"
+                    f"key          {task.task_key}\n"
+                    f"title        {task.title}\n"
+                    f"status       {task.status.value}\n"
+                    f"priority     {task.priority}\n"
+                    f"attempts     {task.attempt_count}/{task.max_attempts}\n"
+                    f"dependencies {', '.join(deps) or '(none)'}\n"
+                    f"description  {task.description}\n"
+                    f"acceptance   {task.acceptance_criteria or '(none)'}\n"
+                    f"result       {task.result_summary or '(none)'}\n"
+                    f"last error   {task.last_error or '(none)'}",
+                    title="Task",
+                )
+            )
+            history = await maintenance.tasks.attempts(task_id)
+            if history:
+                table = Table(title="Attempts")
+                table.add_column("#", width=3)
+                table.add_column("status")
+                table.add_column("started")
+                table.add_column("finished")
+                table.add_column("summary / error")
+                for attempt in history:
+                    table.add_row(
+                        str(attempt.attempt_no),
+                        attempt.status.value,
+                        attempt.started_at.strftime("%m-%d %H:%M"),
+                        attempt.finished_at.strftime("%m-%d %H:%M") if attempt.finished_at else "-",
+                        attempt.completion_summary or attempt.error_message or "",
+                    )
+                console.print(table)
+        finally:
+            await maintenance.close()
+
+    try:
+        asyncio.run(_task())
+    except typer.Exit:
+        raise
+    except BearError as exc:
+        _fail(str(exc), code=1)
+    except Exception as exc:
+        _fail(f"cannot show task: {exc}", code=1)
+
+
+@tasks_app.command("revise")
+def tasks_revise(
+    session_id: str = typer.Argument(..., help="Session id."),
+    plan_file: Path = typer.Option(..., "--file", help="JSON PlanDraft file."),
+    reason: str = typer.Option(..., "--reason", help="Why the plan changed."),
+    config: Path | None = typer.Option(None, "--config"),
+) -> None:
+    """用用户提供的 JSON 计划修订当前 Plan (程序校验依赖与循环)."""
+    settings = _load(
+        config=config,
+        base_url=None,
+        api_key=None,
+        provider=None,
+        model=None,
+        permission=None,
+        max_turns=None,
+    )
+    try:
+        data = json.loads(plan_file.read_text(encoding="utf-8"))
+        draft = PlanDraft.model_validate(data)
+    except Exception as exc:
+        _fail(f"invalid plan file: {exc}", code=2)
+
+    async def _revise() -> None:
+        maintenance = build_maintenance(settings, cwd=Path.cwd())
+        try:
+            record = await maintenance.sessions.get(session_id)
+            if record is None:
+                _fail(f"session not found: {session_id}", code=2)
+            owner = f"cli-task-{os.getpid()}"
+            epoch = await maintenance.sessions.acquire_lease(session_id, owner, 60.0)
+            fence = LeaseFence(owner, epoch)
+            token = set_fence(fence)
+            try:
+                plan = await maintenance.tasks.revise_plan(
+                    session_id, draft, reason=reason, source="user", fence=fence
+                )
+            finally:
+                reset_fence(token)
+                with contextlib.suppress(Exception):
+                    await maintenance.sessions.release_lease(session_id, owner, epoch)
+            console.print(f"plan revised to v{plan.version} with {len(draft.tasks)} task(s)")
+            await _print_plan(maintenance.tasks, session_id)
+        finally:
+            await maintenance.close()
+
+    try:
+        asyncio.run(_revise())
+    except typer.Exit:
+        raise
+    except BearError as exc:
+        _fail(str(exc), code=1)
+    except Exception as exc:
+        _fail(f"revision failed: {exc}", code=1)
+
+
+@tasks_app.command("cancel")
+def tasks_cancel(
+    session_id: str = typer.Argument(..., help="Session id."),
+    config: Path | None = typer.Option(None, "--config"),
+    task_id: str | None = typer.Option(None, "--task", help="Cancel one task instead of the plan."),
+    reason: str = typer.Option("cancelled by user", "--reason"),
+) -> None:
+    """取消当前 Plan 或某个任务。"""
+    settings = _load(
+        config=config,
+        base_url=None,
+        api_key=None,
+        provider=None,
+        model=None,
+        permission=None,
+        max_turns=None,
+    )
+
+    async def _cancel() -> None:
+        maintenance = build_maintenance(settings, cwd=Path.cwd())
+        try:
+            record = await maintenance.sessions.get(session_id)
+            if record is None:
+                _fail(f"session not found: {session_id}", code=2)
+            owner = f"cli-task-{os.getpid()}"
+            epoch = await maintenance.sessions.acquire_lease(session_id, owner, 60.0)
+            fence = LeaseFence(owner, epoch)
+            token = set_fence(fence)
+            try:
+                if task_id:
+                    task = await maintenance.tasks.cancel_task(task_id, reason=reason, fence=fence)
+                    console.print(f"task {task.task_key} cancelled")
+                else:
+                    plan = await maintenance.tasks.cancel_plan(
+                        session_id, reason=reason, fence=fence
+                    )
+                    if plan is None:
+                        _fail("session has no plan", code=2)
+                    console.print("plan cancelled")
+            finally:
+                reset_fence(token)
+                with contextlib.suppress(Exception):
+                    await maintenance.sessions.release_lease(session_id, owner, epoch)
+        finally:
+            await maintenance.close()
+
+    try:
+        asyncio.run(_cancel())
+    except typer.Exit:
+        raise
+    except BearError as exc:
+        _fail(str(exc), code=1)
+    except Exception as exc:
+        _fail(f"cancel failed: {exc}", code=1)
+
+
+@tasks_app.command("retry")
+def tasks_retry(
+    task_id: str = typer.Argument(..., help="Task id."),
+    config: Path | None = typer.Option(None, "--config"),
+    force: bool = typer.Option(
+        False, "--force", help="Allow one extra attempt after the max attempt count."
+    ),
+) -> None:
+    """重试 failed/blocked/cancelled 任务 (受尝试次数上限约束)."""
+    settings = _load(
+        config=config,
+        base_url=None,
+        api_key=None,
+        provider=None,
+        model=None,
+        permission=None,
+        max_turns=None,
+    )
+
+    async def _retry() -> None:
+        maintenance = build_maintenance(settings, cwd=Path.cwd())
+        try:
+            task = await maintenance.tasks.get_task(task_id)
+            if task is None:
+                _fail(f"task not found: {task_id}", code=2)
+            owner = f"cli-task-{os.getpid()}"
+            epoch = await maintenance.sessions.acquire_lease(task.session_id, owner, 60.0)
+            fence = LeaseFence(owner, epoch)
+            token = set_fence(fence)
+            try:
+                updated = await maintenance.tasks.retry_task(task_id, fence=fence, force=force)
+            finally:
+                reset_fence(token)
+                with contextlib.suppress(Exception):
+                    await maintenance.sessions.release_lease(task.session_id, owner, epoch)
+            console.print(f"task {updated.task_key} is {updated.status.value}")
+        finally:
+            await maintenance.close()
+
+    try:
+        asyncio.run(_retry())
+    except typer.Exit:
+        raise
+    except BearError as exc:
+        _fail(str(exc), code=1)
+    except Exception as exc:
+        _fail(f"retry failed: {exc}", code=1)
+
+
+@tasks_app.command("resume")
+def tasks_resume(
+    session_id: str = typer.Argument(..., help="Session id."),
+    config: Path | None = typer.Option(None, "--config"),
+    cwd: Path | None = typer.Option(None, "--cwd", "-C"),
+    run: bool = typer.Option(False, "--run", help="Run the resumed plan."),
+    force: bool = typer.Option(
+        False,
+        "--force",
+        help="Retry tasks whose last attempt used non-idempotent tools.",
+    ),
+) -> None:
+    """恢复崩溃后的任务状态并重试可重试任务。"""
+    settings = _load(
+        config=config,
+        base_url=None,
+        api_key=None,
+        provider=None,
+        model=None,
+        permission=None,
+        max_turns=None,
+    )
+    workspace = _resolve_cwd(cwd)
+
+    async def _resume() -> list[str]:
+        maintenance = build_maintenance(settings, cwd=Path.cwd())
+        try:
+            record = await maintenance.sessions.get(session_id)
+            if record is None:
+                _fail(f"session not found: {session_id}", code=2)
+            owner = f"cli-task-{os.getpid()}"
+            epoch = await maintenance.sessions.acquire_lease(session_id, owner, 120.0)
+            fence = LeaseFence(owner, epoch)
+            token = set_fence(fence)
+            retried: list[str] = []
+            try:
+                await maintenance.tasks.reconcile_after_crash(session_id, fence=fence)
+                for task in await maintenance.tasks.list_tasks(session_id):
+                    if task.status in {
+                        TaskStatus.BLOCKED,
+                        TaskStatus.FAILED,
+                        TaskStatus.CANCELLED,
+                    }:
+                        try:
+                            updated = await maintenance.tasks.retry_task(
+                                task.id, fence=fence, force=force
+                            )
+                            retried.append(updated.task_key)
+                        except TaskStateError as exc:
+                            retried.append(f"{task.task_key}: {exc}")
+            finally:
+                reset_fence(token)
+                with contextlib.suppress(Exception):
+                    await maintenance.sessions.release_lease(session_id, owner, epoch)
+            return retried
+        finally:
+            await maintenance.close()
+
+    try:
+        retried = asyncio.run(_resume())
+    except typer.Exit:
+        raise
+    except BearError as exc:
+        _fail(str(exc), code=1)
+        raise AssertionError("unreachable") from exc
+    except Exception as exc:
+        _fail(f"resume failed: {exc}", code=1)
+        raise AssertionError("unreachable") from exc
+    if retried:
+        console.print("resumed: " + ", ".join(retried))
+    else:
+        console.print("no runnable tasks to resume")
+    if run:
+        raise typer.Exit(
+            code=asyncio.run(_execute_plan(settings, workspace, session_id, json_output=False))
+        )
 
 
 # ---------------------------------------------------------------------- config

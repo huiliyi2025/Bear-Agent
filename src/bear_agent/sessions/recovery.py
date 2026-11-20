@@ -37,6 +37,7 @@ from bear_agent.sessions.checkpoints import CheckpointService
 from bear_agent.sessions.claims import ClaimService
 from bear_agent.sessions.service import SessionService
 from bear_agent.shell.process_registry import ProcessRegistry
+from bear_agent.tasks.service import TaskService
 
 
 @dataclass
@@ -54,6 +55,7 @@ class RecoveryReport:
     # safely consume (e.g. an unrepaired mid-transcript tool call). The runtime
     # refuses to start a new turn until a human inspects or forks the session.
     blocked: bool = False
+    reconciled_tasks: list[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True, slots=True)
@@ -74,6 +76,7 @@ class RecoveryService:
         recorder: EventRecorder,
         audit: AuditService | None = None,
         config: RecoveryConfig | None = None,
+        tasks: TaskService | None = None,
         clock: Clock | None = None,
     ) -> None:
         self.sessions = sessions
@@ -83,6 +86,7 @@ class RecoveryService:
         self.recorder = recorder
         self.audit = audit
         self.config = config or RecoveryConfig()
+        self.tasks = tasks
         self.clock = clock or SystemClock()
 
     async def recover_if_needed(
@@ -109,7 +113,10 @@ class RecoveryService:
         )
         messages = await self.sessions.load_messages(session_id)
         dangling = _find_dangling_calls(messages)
-        if not running_rows and not process_records and not dangling:
+        running_task_attempts = (
+            await self.tasks.running_attempts(session_id) if self.tasks is not None else []
+        )
+        if not running_rows and not process_records and not dangling and not running_task_attempts:
             return RecoveryReport(recovered=False)
 
         report = RecoveryReport(recovered=True, running_tools=len(running_rows))
@@ -143,6 +150,7 @@ class RecoveryService:
             )
             await self._terminate_orphan_processes(session_id, report, fence=fence)
             await self._release_stale_claims(session_id, report, fence=fence, run_id=run_id)
+            await self._reconcile_tasks(session_id, report, fence=fence, run_id=run_id)
 
             completed_payload = self._report_payload(report)
             await self.recorder.record(
@@ -319,6 +327,21 @@ class RecoveryService:
                 "transcript position was found; its status is left unchanged"
             )
 
+    async def _reconcile_tasks(
+        self,
+        session_id: str,
+        report: RecoveryReport,
+        *,
+        fence: LeaseFence,
+        run_id: str | None,
+    ) -> None:
+        if self.tasks is None:
+            return
+        reconciled = await self.tasks.reconcile_after_crash(session_id, fence=fence, run_id=run_id)
+        for task in reconciled:
+            report.reconciled_tasks.append(task.id)
+            report.actions.append(f"marked interrupted task {task.task_key} blocked after crash")
+
     async def _terminate_orphan_processes(
         self, session_id: str, report: RecoveryReport, *, fence: LeaseFence
     ) -> None:
@@ -375,6 +398,7 @@ class RecoveryService:
             "actions": list(report.actions),
             "audit_verified": report.audit_verified,
             "blocked": report.blocked,
+            "reconciled_tasks": list(report.reconciled_tasks),
         }
 
     async def _failure_notice(

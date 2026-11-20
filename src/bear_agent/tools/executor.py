@@ -165,7 +165,7 @@ class ToolExecutor:
             tool_call_id=call.id,
             lease_owner=lease_owner,
             lease_epoch=lease_epoch,
-            extras={"redactor": self.redactor},
+            extras={"redactor": self.redactor, "run_id": run_id},
         )
         generic = self.policy.decide(tool, args)
         preflight: PreflightDecision | None

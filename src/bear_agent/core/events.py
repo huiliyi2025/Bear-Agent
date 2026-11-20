@@ -76,6 +76,28 @@ class EventType(StrEnum):
     # Fork
     SESSION_FORKED = "session.forked"
 
+    # Tasks, plans and todo
+    TASK_PLAN_CREATED = "task.plan.created"
+    TASK_PLAN_REVISED = "task.plan.revised"
+    TASK_PLAN_COMPLETED = "task.plan.completed"
+    TASK_PLAN_BLOCKED = "task.plan.blocked"
+    TASK_PLAN_FAILED = "task.plan.failed"
+    TASK_PLAN_CANCELLED = "task.plan.cancelled"
+    TASK_STARTED = "task.started"
+    TASK_ATTEMPT_STARTED = "task.attempt.started"
+    TASK_ATTEMPT_FINISHED = "task.attempt.finished"
+    TASK_COMPLETION_REQUESTED = "task.completion.requested"
+    TASK_VERIFICATION = "task.verification"
+    TASK_COMPLETED = "task.completed"
+    TASK_FAILED = "task.failed"
+    TASK_BLOCKED = "task.blocked"
+    TASK_CANCELLED = "task.cancelled"
+    TASK_RETRY_SCHEDULED = "task.retry.scheduled"
+    TASK_RUN_STARTED = "task.run.started"
+    TASK_RUN_COMPLETED = "task.run.completed"
+    TASK_RUN_FAILED = "task.run.failed"
+    TASK_RECONCILED = "task.reconciled"
+
     # Ephemeral UI events
     MODEL_TEXT_DELTA = "model.text.delta"
     MODEL_THINKING_DELTA = "model.thinking.delta"
@@ -127,6 +149,26 @@ PERSISTED_EVENT_TYPES: frozenset[EventType] = frozenset(
         EventType.RECOVERY_PROCESS_TERMINATED,
         EventType.RECOVERY_CLAIMS_RELEASED,
         EventType.SESSION_FORKED,
+        EventType.TASK_PLAN_CREATED,
+        EventType.TASK_PLAN_REVISED,
+        EventType.TASK_PLAN_COMPLETED,
+        EventType.TASK_PLAN_BLOCKED,
+        EventType.TASK_PLAN_FAILED,
+        EventType.TASK_PLAN_CANCELLED,
+        EventType.TASK_STARTED,
+        EventType.TASK_ATTEMPT_STARTED,
+        EventType.TASK_ATTEMPT_FINISHED,
+        EventType.TASK_COMPLETION_REQUESTED,
+        EventType.TASK_VERIFICATION,
+        EventType.TASK_COMPLETED,
+        EventType.TASK_FAILED,
+        EventType.TASK_BLOCKED,
+        EventType.TASK_CANCELLED,
+        EventType.TASK_RETRY_SCHEDULED,
+        EventType.TASK_RUN_STARTED,
+        EventType.TASK_RUN_COMPLETED,
+        EventType.TASK_RUN_FAILED,
+        EventType.TASK_RECONCILED,
     }
 )
 

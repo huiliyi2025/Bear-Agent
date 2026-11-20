@@ -55,6 +55,11 @@ from bear_agent.storage.security_repositories import (
     ClaimRepository,
     SecretNameRepository,
 )
+from bear_agent.tasks.engine import TaskEngine
+from bear_agent.tasks.planner import PlanGenerator
+from bear_agent.tasks.service import TaskService
+from bear_agent.tasks.tools import create_task_tools
+from bear_agent.tasks.verifier import ModelTaskVerifier
 from bear_agent.tools.builtin import create_builtin_tools
 from bear_agent.tools.builtin.shell import BashTool
 from bear_agent.tools.executor import ToolExecutor
@@ -81,6 +86,7 @@ class Maintenance:
     checkpoints: CheckpointService
     recovery: RecoveryService
     fork: SessionForkService
+    tasks: TaskService
 
     async def close(self) -> None:
         self.db.close()
@@ -101,6 +107,14 @@ def build_maintenance(
         redactor = SecretRedactor()
         recorder = EventRecorder(sessions, event_bus, redactor)
         audit = AuditService(db, redactor=redactor, clock=clock, enabled=settings.audit.enabled)
+        task_service = TaskService(
+            db,
+            recorder,
+            audit=audit,
+            config=settings.tasks,
+            clock=clock,
+            redactor=redactor,
+        )
         anchors = AnchorRepository(db)
         compactions = CompactionRepository(db)
         context_state = ContextStateRepository(db)
@@ -114,6 +128,7 @@ def build_maintenance(
             audit=audit,
             config=settings.checkpoints,
             redactor=redactor,
+            task_snapshot=task_service.snapshot_sync,
             clock=clock,
         )
         claims = ClaimService(
@@ -133,6 +148,7 @@ def build_maintenance(
             recorder=recorder,
             audit=audit,
             config=settings.recovery,
+            tasks=task_service,
             clock=clock,
         )
         fork = SessionForkService(
@@ -154,6 +170,7 @@ def build_maintenance(
             checkpoints=checkpoints,
             recovery=recovery,
             fork=fork,
+            tasks=task_service,
         )
     except BaseException:
         db.close()
@@ -190,6 +207,10 @@ class Container:
     recovery: RecoveryService
     fork: SessionForkService
     processes: ProcessRegistry
+    tasks: TaskService
+    planner: PlanGenerator
+    task_verifier: ModelTaskVerifier
+    task_engine: TaskEngine | None
 
     async def close(self) -> None:
         try:
@@ -225,6 +246,14 @@ def build_container(
         install_redacting_filter(redactor)
         recorder = EventRecorder(sessions, event_bus, redactor)
         audit = AuditService(db, redactor=redactor, clock=clock, enabled=settings.audit.enabled)
+        task_service = TaskService(
+            db,
+            recorder,
+            audit=audit,
+            config=settings.tasks,
+            clock=clock,
+            redactor=redactor,
+        )
 
         artifact_repository = ArtifactRepository(db)
         checkpoints_repository = CheckpointRepository(db)
@@ -249,6 +278,7 @@ def build_container(
             audit=audit,
             config=settings.checkpoints,
             redactor=redactor,
+            task_snapshot=task_service.snapshot_sync,
             clock=clock,
         )
         processes = ProcessRegistry(
@@ -273,6 +303,9 @@ def build_container(
         registry = ToolRegistry()
         for tool in create_builtin_tools(shell=shell_tool, artifacts=artifacts):
             registry.register(tool)
+        if settings.tasks.enabled:
+            for tool in create_task_tools(task_service):
+                registry.register(tool)
 
         policy = PermissionEngine(settings.agent.permission_mode)
         chosen_approver = approver or AutoApprover()
@@ -311,6 +344,30 @@ def build_container(
             model_caller,
             settings.context.summary_model or settings.agent.default_model,
             max_output_tokens=settings.context.l2_max_summary_tokens,
+        )
+        planner = PlanGenerator(
+            model_caller,
+            settings.tasks.planner_model or settings.agent.default_model,
+            max_tasks=settings.tasks.max_tasks,
+            max_retries=settings.tasks.planner_max_retries,
+            max_output_tokens=settings.tasks.planner_max_output_tokens,
+        )
+        task_verifier = ModelTaskVerifier(
+            model_caller,
+            settings.tasks.verification_model or settings.agent.default_model,
+        )
+        task_engine = (
+            TaskEngine(
+                tasks=task_service,
+                sessions=sessions,
+                verifier=task_verifier,
+                config=settings.tasks,
+                recorder=recorder,
+                audit=audit,
+                clock=clock,
+            )
+            if settings.tasks.enabled
+            else None
         )
 
         async def checkpoint_for_compaction(
@@ -354,6 +411,7 @@ def build_container(
             registry=registry,
             recorder=recorder,
             compactor=compactor,
+            tasks=task_service,
             model=settings.agent.default_model,
             provider_name=settings.agent.default_provider,
             temperature=settings.agent.temperature,
@@ -368,6 +426,7 @@ def build_container(
             recorder=recorder,
             audit=audit,
             config=settings.recovery,
+            tasks=task_service,
             clock=clock,
         )
         runtime = AgentRuntime(
@@ -381,6 +440,8 @@ def build_container(
             recovery=recovery,
             checkpoints=checkpoints if settings.checkpoints.enabled else None,
             checkpoint_interval=settings.checkpoints.interval_turns,
+            task_engine=task_engine,
+            task_max_turns=settings.tasks.max_task_turns,
         )
         fork = SessionForkService(
             sessions=sessions,
@@ -418,6 +479,10 @@ def build_container(
             recovery=recovery,
             fork=fork,
             processes=processes,
+            tasks=task_service,
+            planner=planner,
+            task_verifier=task_verifier,
+            task_engine=task_engine,
         )
     except BaseException:
         db.close()

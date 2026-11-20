@@ -24,6 +24,7 @@ from bear_agent.providers.base import ModelRequest
 from bear_agent.runtime.model_caller import ModelCaller, ModelResponse
 from bear_agent.sessions.models import SessionRecord
 from bear_agent.sessions.service import SessionService
+from bear_agent.tasks.service import TaskService
 from bear_agent.tools.base import ToolResult
 from bear_agent.tools.executor import ToolExecutor
 from bear_agent.tools.registry import ToolRegistry
@@ -49,6 +50,7 @@ class TurnExecutor:
         registry: ToolRegistry,
         recorder: EventRecorder,
         compactor: ContextCompactor | None = None,
+        tasks: TaskService | None = None,
         model: str,
         provider_name: str = "",
         temperature: float = 0.0,
@@ -62,6 +64,7 @@ class TurnExecutor:
         self.registry = registry
         self.recorder = recorder
         self.compactor = compactor
+        self.tasks = tasks
         self.model = model
         self.provider_name = provider_name
         self.temperature = temperature
@@ -110,6 +113,13 @@ class TurnExecutor:
         else:
             messages_for_context = messages
             system_extra = ""
+        task_block = ""
+        if self.tasks is not None:
+            task_block = await self.tasks.render_context(session.id)
+            if task_block:
+                system_extra = "\n\n".join(
+                    part for part in (system_extra, task_block) if part.strip()
+                )
         built = self.context_builder.build(messages_for_context, tools, system_extra=system_extra)
         await self.recorder.record(
             session.id,
@@ -124,6 +134,7 @@ class TurnExecutor:
                 "dropped_messages": built.dropped_messages,
                 "truncated": built.truncated,
                 "budget_tokens": built.budget_tokens,
+                "task_context_chars": len(task_block),
                 **compaction_info,
             },
         )

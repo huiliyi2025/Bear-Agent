@@ -243,6 +243,50 @@ class RecoveryConfig(BaseModel):
     require_audit: bool = True
 
 
+class TasksConfig(BaseModel):
+    """Task / Plan / Todo engine policy.
+
+    Model planning and completion verification are bounded: the program owns
+    dependency checks, state transitions, retry limits and revision limits.
+    """
+
+    enabled: bool = True
+    max_tasks: int = 50
+    max_attempts: int = 3
+    max_revisions: int = 10
+    max_tasks_per_run: int = 50
+    # 0 means use agent.max_turns for each task run.
+    max_task_turns: int = 20
+    verify_completion: bool = True
+    planner_model: str = ""
+    verification_model: str = ""
+    planner_max_retries: int = 2
+    planner_max_output_tokens: int = 4096
+    context_max_tokens: int = 1_200
+
+    @field_validator(
+        "max_tasks",
+        "max_attempts",
+        "max_tasks_per_run",
+        "max_task_turns",
+        "planner_max_retries",
+        "planner_max_output_tokens",
+        "context_max_tokens",
+    )
+    @classmethod
+    def _positive(cls, value: int) -> int:
+        if value < 0:
+            raise ValueError("must not be negative")
+        return value
+
+    @field_validator("max_revisions")
+    @classmethod
+    def _non_negative(cls, value: int) -> int:
+        if value < 0:
+            raise ValueError("must not be negative")
+        return value
+
+
 class Settings(BaseModel):
     providers: dict[str, ProviderConfig] = Field(
         default_factory=lambda: {"default": ProviderConfig()}
@@ -258,6 +302,7 @@ class Settings(BaseModel):
     context: ContextConfig = Field(default_factory=ContextConfig)
     checkpoints: CheckpointConfig = Field(default_factory=CheckpointConfig)
     recovery: RecoveryConfig = Field(default_factory=RecoveryConfig)
+    tasks: TasksConfig = Field(default_factory=TasksConfig)
 
     def provider(self, name: str | None = None) -> ProviderConfig:
         provider_name = name or self.agent.default_provider

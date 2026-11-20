@@ -36,6 +36,7 @@ src/bear_agent/
   config/        Settings 模型、TOML 加载器、初始化模板
   storage/       Database、迁移、Repository、continuity_repositories
   sessions/      SessionRecord、SessionService、租约、Checkpoint、Recovery、Fork、Claims
+  tasks/         Plan/Task/Todo 模型、状态机、TaskService、Planner、Verifier、Engine、Tools
   providers/     ModelProvider 端口、OpenAI 兼容适配器、重试
   tools/         Tool 契约、注册表、执行器、builtin/（含 shell）
   shell/         命令策略、进程运行器、进程登记/恢复、环境、sandbox/
@@ -136,6 +137,19 @@ bear secret list            # 只看名称，不显示值
 - Fork 不得修改源 Session；不复制执行状态、Claim、审批、进程与 Checkpoint 行。
 - 新持久化面（Checkpoint 状态、Anchors、artifact、进程预览、摘要）必须经过 `SecretRedactor`。
 - 测试：`uv run pytest tests/unit/test_compaction.py tests/unit/test_checkpoints.py tests/unit/test_recovery.py tests/unit/test_fork.py tests/unit/test_fencing.py tests/integration/test_compaction_runtime.py tests/integration/test_recovery_runtime.py tests/integration/test_fork_runtime.py -q`。
+
+## Task / Plan / Todo
+
+- 状态只能通过 `TaskService` 修改；不要直接 UPDATE `tasks`/`plans`。每次写入必须在同一事务内校验 fence。
+- 新状态需要同步 `ALLOWED_TASK_TRANSITIONS`、DB CHECK 与测试；非法转移必须拒绝。
+- 依赖只存 `task_dependencies`；创建/修订后必须跑循环检测。调度只选择依赖 completed/skipped 的 pending Task。
+- 完成任务必须先有 `task_complete` 请求，再经 evidence 或模型 verifier；禁止模型直接写 completed。
+- 失败任务如果执行过非幂等工具，不得自动重试；崩溃中的 attempt 只能标记 unknown + Task blocked。
+- Plan 修订必须保留 `plan_revisions` 快照，并对 completed/failed/blocked/cancelled/removed 任务采用文档化策略。
+- `TaskEngine` 不得 import Runtime；Runtime `run_plan` 负责 Lease/心跳与 per-task `_execute_request`。
+- Task 工具只调用 TaskService，走 ToolExecutor；不要绕过权限、Claim、审计。
+- Context 注入使用 `TaskService.render_context`，保持 pinned；不要依赖 Prompt 来保存任务状态。
+- 测试：`uv run pytest tests/unit/test_tasks_service.py tests/unit/test_task_engine.py tests/unit/test_task_planner.py tests/unit/test_task_verifier.py tests/unit/test_task_tools.py tests/integration/test_task_runtime.py tests/integration/test_task_engine_runtime.py -q`。
 
 ## 添加 Provider
 

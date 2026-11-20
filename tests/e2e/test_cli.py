@@ -5,7 +5,7 @@ import re
 from pathlib import Path
 
 import pytest
-from tests.support import ScriptedProvider, text_script
+from tests.support import ScriptedProvider, text_script, tool_script
 from typer.testing import CliRunner
 
 from bear_agent.bootstrap import build_container as real_build_container
@@ -39,8 +39,15 @@ data_dir = "{data_dir}"
 
 
 def _patch_provider(monkeypatch: pytest.MonkeyPatch, text: str) -> None:
+    _patch_scripts(monkeypatch, [text_script(text)])
+
+
+def _patch_scripts(
+    monkeypatch: pytest.MonkeyPatch,
+    scripts: list[list],  # type: ignore[type-arg]
+) -> None:
     def fake_build(settings, *, cwd, approver=None, provider=None, bus=None):
-        scripted = ScriptedProvider([text_script(text)])
+        scripted = ScriptedProvider([list(script) for script in scripts])
         return real_build_container(
             settings, cwd=cwd, approver=approver, provider=scripted, bus=bus
         )
@@ -172,6 +179,182 @@ def test_session_checkpoints_fork_and_recover_commands(
     )
     assert recovered.exit_code == 0, recovered.output
     assert "no recovery needed" in recovered.output
+
+
+def _seed_task_plan(tmp_path: Path, config: Path) -> tuple[str, str]:
+    import asyncio
+
+    from bear_agent.bootstrap import build_maintenance
+    from bear_agent.config.loader import load_settings
+    from bear_agent.core.fencing import LeaseFence, reset_fence, set_fence
+    from bear_agent.tasks.models import PlanDraft, TaskSpec
+
+    settings = load_settings(config)
+    maintenance = build_maintenance(settings, cwd=tmp_path)
+
+    async def _seed() -> tuple[str, str]:
+        session = await maintenance.sessions.create(
+            cwd=tmp_path, model="fake-model", provider="fake", title="task plan"
+        )
+        owner = "seed-owner"
+        epoch = await maintenance.sessions.acquire_lease(session.id, owner, 60)
+        fence = LeaseFence(owner, epoch)
+        token = set_fence(fence)
+        try:
+            await maintenance.tasks.create_plan(
+                session.id,
+                PlanDraft(
+                    goal="implement and verify the feature",
+                    tasks=[
+                        TaskSpec(
+                            key="T1",
+                            title="verify implementation",
+                            description="run the checks",
+                            acceptance_criteria="checks pass",
+                            verification="evidence",
+                        )
+                    ],
+                ),
+                source="user",
+                fence=fence,
+            )
+            task = (await maintenance.tasks.list_tasks(session.id))[0]
+        finally:
+            reset_fence(token)
+            await maintenance.sessions.release_lease(session.id, owner, epoch)
+        return session.id, task.id
+
+    try:
+        return asyncio.run(_seed())
+    finally:
+        maintenance.db.close()
+
+
+def test_tasks_show_task_and_cancel_commands(tmp_path: Path) -> None:
+    runner = CliRunner()
+    config = _config(tmp_path)
+    session_id, task_id = _seed_task_plan(tmp_path, config)
+
+    shown = runner.invoke(main.app, ["tasks", "show", session_id, "--config", str(config)])
+    assert shown.exit_code == 0, shown.output
+    assert "implement and verify the feature" in shown.output
+    assert "T1" in shown.output
+    assert "verify implementation" in shown.output
+
+    detail = runner.invoke(main.app, ["tasks", "task", task_id, "--config", str(config)])
+    assert detail.exit_code == 0, detail.output
+    assert "verify implementation" in detail.output
+    assert "checks pass" in detail.output
+
+    cancelled = runner.invoke(main.app, ["tasks", "cancel", session_id, "--config", str(config)])
+    assert cancelled.exit_code == 0, cancelled.output
+    assert "plan cancelled" in cancelled.output
+    after = runner.invoke(main.app, ["tasks", "show", session_id, "--config", str(config)])
+    assert after.exit_code == 0, after.output
+    assert "cancelled" in after.output
+
+
+def test_tasks_plan_generation_and_run(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    runner = CliRunner()
+    config = _config(tmp_path)
+    plan_json = json.dumps(
+        {
+            "goal": "implement the feature",
+            "tasks": [
+                {
+                    "key": "T1",
+                    "title": "implement",
+                    "description": "write code",
+                    "acceptance_criteria": "tests pass",
+                    "dependencies": [],
+                    "priority": 1,
+                    "verification": "evidence",
+                }
+            ],
+        }
+    )
+    _patch_scripts(monkeypatch, [text_script(plan_json)])
+    planned = runner.invoke(
+        main.app, ["tasks", "plan", "implement the feature", "--config", str(config)]
+    )
+    assert planned.exit_code == 0, planned.output
+    assert "created with 1 task" in planned.output
+    assert "implement" in planned.output
+
+    # A separate invocation with scripts for the task run.
+    _patch_scripts(
+        monkeypatch,
+        [
+            tool_script(
+                "t1-complete",
+                "task_complete",
+                {"summary": "tests pass", "evidence": ["pytest"]},
+            ),
+            text_script("done"),
+        ],
+    )
+    settings = main._load(
+        config=config,
+        base_url=None,
+        api_key=None,
+        provider=None,
+        model=None,
+        permission=None,
+        max_turns=None,
+    )
+    import asyncio
+
+    from bear_agent.bootstrap import build_maintenance
+
+    async def session_for_plan() -> str:
+        maintenance = build_maintenance(settings, cwd=tmp_path)
+        try:
+            sessions = await maintenance.sessions.list_recent(5)
+            return sessions[0].id
+        finally:
+            await maintenance.close()
+
+    session_id = asyncio.run(session_for_plan())
+    ran = runner.invoke(main.app, ["tasks", "run", session_id, "--config", str(config)])
+    assert ran.exit_code == 0, ran.output
+    assert "completed" in ran.output
+    assert "task T1 completed" in ran.output
+
+
+def test_tasks_run_json_and_unknown_session_exit_codes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runner = CliRunner()
+    config = _config(tmp_path)
+    missing = runner.invoke(
+        main.app,
+        ["tasks", "run", "ses_missing", "--config", str(config), "--json"],
+    )
+    assert missing.exit_code == 2, missing.output
+    assert "invalid session" in missing.output
+
+    session_id, _task_id = _seed_task_plan(tmp_path, config)
+    _patch_scripts(
+        monkeypatch,
+        [
+            tool_script(
+                "t1-complete",
+                "task_complete",
+                {"summary": "tests pass", "evidence": ["pytest"]},
+            ),
+            text_script("done"),
+        ],
+    )
+    result = runner.invoke(
+        main.app,
+        ["tasks", "run", session_id, "--config", str(config), "--json"],
+    )
+    assert result.exit_code == 0, result.output
+    payloads = [json.loads(line) for line in result.output.splitlines() if line.strip()]
+    assert any(item.get("type") == "plan_result" for item in payloads)
+    plan_result = next(item for item in payloads if item.get("type") == "plan_result")
+    assert plan_result["status"] == "completed"
+    assert plan_result["tasks_completed"] == 1
 
 
 def test_secret_commands_with_in_memory_store(

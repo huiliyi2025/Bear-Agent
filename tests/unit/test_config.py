@@ -126,6 +126,13 @@ keep = 5
 [recovery]
 kill_orphan_processes = false
 require_audit = false
+
+[tasks]
+max_tasks = 12
+max_attempts = 2
+max_revisions = 4
+verify_completion = false
+max_task_turns = 5
 """,
         encoding="utf-8",
     )
@@ -138,10 +145,16 @@ require_audit = false
     assert settings.checkpoints.keep == 5
     assert settings.recovery.kill_orphan_processes is False
     assert settings.recovery.require_audit is False
+    assert settings.tasks.max_tasks == 12
+    assert settings.tasks.max_attempts == 2
+    assert settings.tasks.max_revisions == 4
+    assert settings.tasks.verify_completion is False
+    assert settings.tasks.max_task_turns == 5
     rendered = settings_to_toml(settings)
     assert "[context]" in rendered
     assert "[checkpoints]" in rendered
     assert "[recovery]" in rendered
+    assert "[tasks]" in rendered
 
 
 def test_invalid_trigger_ratio_rejected(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -160,3 +173,5 @@ def test_default_template_parses(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     assert settings.context.compaction_enabled is True
     assert settings.checkpoints.keep == 20
     assert settings.recovery.require_audit is True
+    assert settings.tasks.enabled is True
+    assert settings.tasks.max_attempts == 3

@@ -1,6 +1,6 @@
 # 架构
 
-> 状态：阶段 3（上下文压缩、Checkpoint、恢复与 Fork）。本文描述当前已经实现的能力，以及后续阶段必须遵守的边界。
+> 状态：阶段 4（Task / Plan / Todo Engine）。本文描述当前已经实现的能力，以及后续阶段必须遵守的边界。
 
 ## 目标
 
@@ -11,7 +11,7 @@ Bear-Agent 是本地优先的 Agent Harness，具备四项不可妥协的属性�
 3. **执行层安全**——权限与路径边界由代码强制执行，而不是依赖 Prompt 请求模型遵守。
 4. **可替换的边缘**——模型、存储、工具与 UI 都是端口/适配器。
 
-阶段 3 的非目标：托管多租户服务、分布式 Worker、图形化工作流编排器、模型训练。
+阶段 4 的非目标：托管多租户服务、分布式 Worker、图形化工作流编排器、模型训练。
 
 ## 分层
 
@@ -48,6 +48,9 @@ Bear-Agent 是本地优先的 Agent Harness，具备四项不可妥协的属性�
 - `sessions/checkpoints.py`、`sessions/recovery.py`、`sessions/fork.py` 通过 Repository 与 SessionService 工作，不 import Runtime。
 - `artifacts/store.py` 只做内容寻址文件 I/O；元数据在 SQLite。
 - `core/fencing.py` 的 ambient `LeaseFence` 由 Runtime 设置，Repository 在同一事务内校验。
+- `tasks/service.py` 拥有 Plan/Task 状态机与依赖调度；`tasks/engine.py` 只做执行决策，不 import Runtime。
+- `runtime/runtime.py` 的 `run_plan` 持有单租约并驱动 TaskEngine；Task 状态更新与执行处于同一 fence。
+- `tasks/tools.py` 只调用 TaskService，不能绕过 ToolExecutor/Permission/Claim/Audit。
 
 ## Runtime 执行流程
 
@@ -109,6 +112,7 @@ CLI / run 命令
 | `config` | TOML + 环境变量 + CLI 覆盖合并 | 启动 Agent |
 | `storage` | SQLite Schema、事务、Repository | 业务决策 |
 | `sessions` | 会话记录、转录、租约、Checkpoint、恢复、Fork | 模型调用 |
+| `tasks` | Plan/Task/Todo 模型、状态机、依赖调度、规划、验证、执行决策 | Tool/权限执行 |
 | `shell/process_registry` | 记录与终止运行中的 Shell 进程 | 命令策略 |
 | `providers` | Provider 端口、OpenAI 兼容适配器、重试分类 | 工具执行 |
 | `tools` | 工具契约、注册表、参数校验、执行器、内置工具 | 权限策略 |
@@ -153,6 +157,12 @@ checkpoint.created / checkpoint.invalid / checkpoint.pruned
 recovery.started / recovery.completed / recovery.failed
 recovery.tool.reconciled / recovery.process.terminated / recovery.claims.released
 session.forked
+task.plan.created / task.plan.revised / task.plan.completed / task.plan.blocked
+task.plan.failed / task.plan.cancelled
+task.started / task.attempt.started / task.attempt.finished
+task.completion.requested / task.verification
+task.completed / task.failed / task.blocked / task.cancelled / task.retry.scheduled
+task.run.started / task.run.completed / task.run.failed / task.reconciled
 model.text.delta / model.thinking.delta / tool.started / tool.finished
 ```
 
@@ -179,6 +189,11 @@ SQLite（WAL）是状态真源。截至阶段 3 的表：
 - `context_state`——generation、最近压缩、L3 失败熔断状态。
 - `process_records`——运行中的 Shell 进程（pid/pgid/owner），用于崩溃恢复。
 - `sessions.parent_session_id` / `fork_message_seq` / `fork_checkpoint_id`——Fork 来源。
+- `plans`——每个 Session 当前 Plan、goal、status、version。
+- `plan_revisions`——Plan 版本快照、修订原因/来源。
+- `tasks`——Task 定义、状态、尝试计数、验收标准、结果。
+- `task_dependencies`——Task 依赖边。
+- `task_attempts`——每次执行的 attempt、完成请求/验证、错误与结果。
 
 所有多行变更都使用显式 `BEGIN IMMEDIATE` 事务。消息行与其消息事件一起写入；工具调用行通过 Repository 事务更新。所有会话状态写入默认读取 ambient LeaseFence，并在同一事务中校验 owner/epoch/过期时间。
 
@@ -202,6 +217,14 @@ L1 把旧工具输出写入 artifact 并替换为预览；L2 生成确定性摘�
 Checkpoint 保存指针（event/message 序号）与无法从 Transcript 推导的状态（context generation、anchors、工具快照）。checksum 覆盖 session、kind、序号、状态与 schema version。损坏或不兼容的 Checkpoint 会被忽略并记录事件，Transcript 仍是事实来源。
 
 恢复只修复可安全修复的中间态：尾部的悬空 tool_call 会得到明确的 “unknown / 未自动重试” 合成结果；非幂等工具不会自动重放；旧 Claim 释放；遗留 Shell 进程经身份校验后终止。审计链损坏时 fail-closed。
+
+## Task / Plan / Todo
+
+Plan 是 Session 当前的结构化目标；Task 是带依赖、验收标准和状态的执行节点；Todo 是 Task 的只读投影。Plan 修订写入版本化快照，Task 保持稳定 ID，因此执行历史不因修订复制。
+
+调度由程序完成：`claim_next` 在事务内选择依赖已完成、pending、active 的最高优先级 Task，转为 in_progress 并创建 attempt；同一 Session 同时只有一个 in_progress Task。运行结果由 `TaskEngine` 结合 `task_complete` 请求、evidence 或独立模型验证决定 completed/failed/blocked，模型不能直接写状态。
+
+`AgentRuntime.run_plan` 在一次持续 Lease 下循环：领取 Task → 用现有 turn/tool 路径执行 → 验证 → 更新状态 → 下一个 Task。每轮固定注入 Plan/Todo/当前 Task，压缩不会移除。执行过非幂等工具的失败 Task 不会自动重试；崩溃中的 running attempt 由 Recovery 标记 unknown、Task 标记 blocked。
 
 ## Session Fork
 

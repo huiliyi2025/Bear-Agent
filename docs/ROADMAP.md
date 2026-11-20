@@ -10,8 +10,8 @@
 | P1 | 内核基础 | **已完成** |
 | P2 | Shell 执行与执行安全 | **已完成** |
 | P3 | 上下文压缩 + Checkpoint + 恢复 | **已完成** |
-| P4 | 持久化 Task / Plan / Todo 引擎 | 下一阶段 |
-| P5 | Hooks、插件、MCP、Provider Fallback | 计划中 |
+| P4 | 持久化 Task / Plan / Todo 引擎 | **已完成** |
+| P5 | Hooks、插件、MCP、Provider Fallback | 下一阶段 |
 | P6 | 可观测性、Trace、评估 | 计划中 |
 | P7 | TUI、打包、发布工程 | 计划中 |
 | P8 | Server/Web UI、多会话、子代理 | 可选 |
@@ -188,21 +188,49 @@
 - 压缩 artifact 写入与 compaction 行之间不是跨资源事务，极端失败会留下未引用文件（内容寻址、无害）。
 - Fork 在单个 `BEGIN IMMEDIATE` 事务中复制整个历史；超大 Transcript 或源会话正在高频写入时，可能让其他写入等待到 busy timeout。建议在会话空闲时 Fork。
 
-## P4——持久化 Task / Plan / Todo 引擎
+## P4——持久化 Task / Plan / Todo 引擎（已完成）
+
+> 完成报告：[P4-COMPLETION-REPORT.md](P4-COMPLETION-REPORT.md)。
 
 ### 范围
 
-- Task、Plan（版本化）、Step（依赖、尝试次数、验收）、Todo 投影。
-- Retry、Replan、验证、计划审批、Plan Mode。
-- 任务事件与进度投影；从第一个未完成步骤恢复。
-- `todo` 与 `plan` 工具。
+- Task、Plan（版本化）、依赖、尝试次数、验收、Todo 投影。
+- Plan 生成、Plan 修订、状态机、调度、完成验证。
+- Retry、Block、Cancel、Resume；任务事件与审计。
+- Runtime 集成、Checkpoint、Recovery、Fork 与压缩边界。
+- CLI 与交互命令。
 
-### 验收
+### 已交付
 
-- 多步骤任务重启后从第一个未完成步骤继续。
-- 失败步骤按策略重试，之后 Replan 或带原因阻塞。
-- 任务完成必须有证据；未验证完成必须显式标记。
-- Todo 与 Plan 永不分裂。
+- Schema v5：plans、plan_revisions、tasks、task_dependencies、task_attempts。
+- `tasks/models.py`：Task/Plan/Attempt 状态、显式转移表、PlanDraft/TodoItem、依赖/循环校验。
+- `tasks/service.py`：创建/修订 Plan、claim、状态转移、attempt、重试/阻塞/取消、崩溃对账、快照、渲染。
+- `tasks/planner.py`：结构化模型规划 + 程序校验 + 有界修复。
+- `tasks/verifier.py`：EvidenceVerifier、ModelTaskVerifier（fail-closed）。
+- `tasks/engine.py`：调度、run 结果处理、完成验证、副作用保护、预算、报告。
+- `tasks/tools.py`：task_complete / task_block / plan_revise。
+- Runtime `run_plan`：单租约跨任务执行；每任务独立 run_id/轮次预算；Task Checkpoint。
+- Checkpoint tasks 快照；Recovery 对账 running attempt；Fork 不继承任务。
+- 每轮 pinned Task/Plan/Todo 上下文，压缩不丢失。
+- CLI `tasks` 命令与交互命令；配置 `[tasks]`。
+
+### 验收证据
+
+- 状态机非法转移、循环依赖、依赖调度、并发 claim、修订合并与上限、fencing、崩溃对账均有测试。
+- 真实 Runtime + ScriptedProvider + 真实 TaskService/ToolExecutor 执行依赖 Plan；完成验证、事件、审计、Checkpoint 通过。
+- 中断 attempt 在下一轮 Plan 执行前被标记 unknown/blocked，且不自动重跑。
+- 非幂等工具失败后阻塞而非自动重试。
+- Fork 不继承 Plan/Task。
+- CLI plan/show/run/task/revise/cancel/retry/resume 有 E2E 覆盖。
+- 全量 pytest、ruff、format、mypy、build 通过（见 P4 Completion Report）。
+
+### 已知限制
+
+- 模型验证仍可能误判；evidence 模式不判断语义质量。
+- 自动重试只对未执行非幂等工具的任务开放。
+- Plan 长时间持有 Session 租约；恢复/重试需要用户显式操作。
+- Fork 不继承 Plan/Task；需要重新规划。
+- Transcript 会累积每个任务的 prompt 与结果，长 Plan 依赖压缩。
 
 ## P5——可扩展性
 

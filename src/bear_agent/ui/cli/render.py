@@ -45,6 +45,54 @@ class Renderer:
             self.console.print(
                 f"[yellow]retrying provider: {event.payload.get('reason', '')}[/yellow]"
             )
+        elif event.type == EventType.TASK_RUN_STARTED:
+            if self._text_started:
+                self.console.print()
+                self._text_started = False
+            self.console.print("[bold cyan]plan execution started[/bold cyan]")
+        elif event.type == EventType.TASK_STARTED:
+            if self._text_started:
+                self.console.print()
+                self._text_started = False
+            self.console.print(
+                f"[cyan]task {event.payload.get('task_key', '?')}[/cyan] "
+                f"{event.payload.get('title', '')} "
+                f"(attempt {event.payload.get('attempt', '?')})"
+            )
+        elif event.type == EventType.TASK_COMPLETED:
+            self.console.print(
+                f"[green]task {event.payload.get('task_key', '?')} completed[/green]"
+            )
+        elif event.type == EventType.TASK_RETRY_SCHEDULED:
+            self.console.print(
+                f"[yellow]task {event.payload.get('task_key', '?')} will retry: "
+                f"{event.payload.get('reason', '')}[/yellow]"
+            )
+        elif event.type in {EventType.TASK_FAILED, EventType.TASK_BLOCKED}:
+            self.console.print(
+                f"[red]task {event.payload.get('task_key', '?')} "
+                f"{'failed' if event.type == EventType.TASK_FAILED else 'blocked'}: "
+                f"{event.payload.get('reason', '')}[/red]"
+            )
+        elif event.type == EventType.TASK_VERIFICATION:
+            result = "passed" if event.payload.get("completed") else "rejected"
+            self.console.print(
+                f"[dim]verification {result}: {event.payload.get('reason', '')}[/dim]"
+            )
+        elif event.type == EventType.TASK_PLAN_REVISED:
+            self.console.print(
+                f"[cyan]plan revised[/cyan] v{event.payload.get('version', '?')}: "
+                f"{event.payload.get('reason', '')}"
+            )
+        elif event.type == EventType.TASK_PLAN_COMPLETED:
+            self.console.print("[green]plan completed[/green]")
+        elif event.type in {EventType.TASK_PLAN_BLOCKED, EventType.TASK_PLAN_FAILED}:
+            self.console.print(f"[red]plan {event.type.value.split('.')[-1]}[/red]")
+        elif event.type == EventType.TASK_RUN_COMPLETED:
+            self.console.print(
+                f"[dim]plan run finished: {event.payload.get('status', '')} "
+                f"({event.payload.get('reason', '')})[/dim]"
+            )
         elif event.type in (
             EventType.RUN_COMPLETED,
             EventType.RUN_CANCELLED,

@@ -2,6 +2,42 @@
 
 记录所有重要变更。项目按阶段路线图推进；公开版本发布后使用语义化版本。
 
+## [0.4.0] — 2026-11-20 — 阶段 4：Task / Plan / Todo Engine
+
+### 新增
+
+- Plan / Task / Todo 数据模型：Plan 版本化、Task 稳定身份、Todo 只读投影。
+- 完整 Task 状态机与显式状态转移表：pending / in_progress / completed / failed / blocked / cancelled / skipped。
+- 依赖表、拓扑调度、优先级排序、循环依赖/未知依赖/自依赖校验；同一 Session 同时只有一个 in_progress Task。
+- Plan 生成：模型输出严格 JSON，程序校验结构、依赖与环；有界修复调用；失败可行动报错。
+- Plan 修订：按 task_key 合并、版本快照、修订上限；已完成/失败/阻塞/取消/移除任务有明确策略；拒绝在有任务执行中修订。
+- Task Engine：原子领取任务、attempt 记录、run 结果处理、独立完成验证（evidence 或模型）、失败重试/阻塞/取消。
+- 非幂等副作用保护：执行过非幂等工具的失败任务不会自动重试。
+- Runtime `run_plan`：整个 Plan 共用 Session Lease/Epoch 与心跳，复用 ToolExecutor、PermissionEngine、Claim、Audit、Sandbox、Checkpoint 与压缩。
+- 每轮 pinned Task/Plan/Todo 上下文；压缩与 L4 不会丢失当前任务方向。
+- Task 工具：`task_complete`、`task_block`、`plan_revise`，只通过 ToolExecutor 执行。
+- Checkpoint 增加 tasks 快照；Recovery 将 running attempt 标记 unknown、Task 标记 blocked，不自动重放。
+- Session Fork 不继承 Plan/Task/Attempt，避免不安全完成状态继承。
+- CLI：`tasks plan/show/run/task/revise/cancel/retry/resume`；交互 `/plan`、`/tasks`、`/run-plan`、`/task`、`/cancel-plan`。
+- 配置 `[tasks]`：任务数、尝试次数、修订次数、每轮任务预算、每任务轮次、验证开关与模型、上下文上限。
+- Schema v5：plans、plan_revisions、tasks、task_dependencies、task_attempts。
+
+### 安全与可靠性
+
+- 所有 Task 状态写入在事务内校验 Session Lease owner/epoch/expiry。
+- 完成必须经过独立验证或证据门槛；模型不能直接写状态。
+- 崩溃恢复不自动重放任务；失败后执行过非幂等工具的任务要求显式重试。
+- Task 事件与审计覆盖创建、修订、开始、完成、失败、阻塞、取消、重试、验证与恢复。
+- 模型生成的 Plan/修订经过程序结构、依赖与循环校验。
+
+### 已知限制
+
+- 模型验证仍可能误判或受到 Prompt Injection；evidence 模式不判断语义质量。
+- 自动重试只对未执行非幂等工具的任务开放；其余需要用户介入。
+- Plan 执行期间长期持有 Session 租约。
+- Fork 不继承任务计划，需要重新规划。
+- 每次 Task run 是一次独立的模型对话轮次序列，Transcript 会累积任务 prompt。
+
 ## [0.3.0] — 2026-11-19 — 阶段 3：上下文压缩、Checkpoint、恢复与 Fork
 
 ### 新增

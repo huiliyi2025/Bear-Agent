@@ -65,6 +65,11 @@ def test_v1_database_migrates_to_current(tmp_path: Path) -> None:
             "context_anchors",
             "context_state",
             "process_records",
+            "plans",
+            "plan_revisions",
+            "tasks",
+            "task_dependencies",
+            "task_attempts",
         ):
             assert _columns(path, table), table
     finally:
@@ -79,6 +84,8 @@ def test_v2_database_migrates_to_current(tmp_path: Path) -> None:
         assert _version(path) == SCHEMA_VERSION
         assert _columns(path, "process_records")
         assert _columns(path, "checkpoints")
+        assert _columns(path, "plans")
+        assert _columns(path, "tasks")
     finally:
         db.close()
 

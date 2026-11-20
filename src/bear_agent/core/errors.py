@@ -69,6 +69,30 @@ class ArtifactCorrupt(ArtifactError):
     pass
 
 
+class TaskError(BearError):
+    pass
+
+
+class TaskValidationError(TaskError):
+    pass
+
+
+class PlanValidationError(TaskValidationError):
+    pass
+
+
+class TaskStateError(TaskError):
+    pass
+
+
+class PlanGenerationError(TaskError):
+    pass
+
+
+class TaskExecutionError(TaskError):
+    pass
+
+
 class ClaimError(BearError):
     pass
 
