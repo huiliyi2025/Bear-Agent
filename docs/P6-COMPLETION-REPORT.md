@@ -3,7 +3,7 @@
 - 阶段：P6 — Observability / Trace / Metrics / Diagnostics / Benchmark
 - 日期：2026-11-20
 - 版本：0.6.0
-- 状态：实现、测试、审查与文档完成；按要求未执行 Git commit，未进入 P7。
+- 状态：实现、测试、审查与文档完成；已提交并推送（`b4520d2`、`37df304`），三平台 CI 全绿；未进入 P7。
 
 ## 1. 交付内容
 
@@ -73,7 +73,8 @@
 
 - **Windows 11**：完整测试、CLI、Benchmark、真实 stdio MCP、Plugin Hook、Trace/Metrics/Diagnostics 全部通过；Windows Shell 在 `sandbox.mode=require` 下按设计不可用，相关场景 SKIP。
 - **Linux（WSL Ubuntu 24.04）**：完整测试通过；使用真实 `bubblewrap 0.9.0` 运行 bwrap 文件系统隔离测试（包括根路径词法拒绝与私有 `/tmp` 语义）。
-- **macOS**：本机不可用；未运行 Seatbelt 实机测试。GitHub Actions 在 P6 前的 CI 修复提交 `024501a` 上已三平台全绿；P6 工作区未提交，因此 macOS 尚未验证 P6 改动，需提交后由 CI 给出实际结果。
+- **macOS**：本机不可用；P6 提交后的 GitHub Actions macOS job 已通过（包括 Seatbelt 相关测试与 Benchmark 环境降级路径）。未做人工 Seatbelt 实机操作验证。
+- **CI**：P6 提交 `b4520d2` 与 `37df304` 的 GitHub Actions 在 Ubuntu/Windows/macOS 全部成功。首次 macOS 运行暴露了 shell Benchmark 的环境性失败，修复后三平台全绿（运行 `44719334307`）。
 
 ### 2.2 真实验证与模拟验证
 
@@ -87,7 +88,7 @@
 **模拟/条件验证**
 
 - 真实外部模型 Provider 网络未验证；Provider 场景使用 ScriptedProvider/respx。
-- macOS Seatbelt 未实机验证。
+- macOS Seatbelt 由 CI 验证测试通过，未做人工实机操作验证。
 - 非 OpenAI-compatible Provider 仍需 adapter；真实第三方 Provider 的 tool/usage/stream 差异未全面验证。
 - Git 工作区脏时 `git_dirty=true`，Benchmark 结果仍绑定 commit 但无法区分未提交改动。
 
@@ -149,7 +150,7 @@
 - Fencing 拒绝计数为进程内；重启重置。
 - Cost 是配置价格估算，不是 Provider 账单；缓存计价与四舍五入因 Provider 而异。
 - Benchmark 为单机、短样本；不代表生产吞吐/统计显著性；真实 Provider 受网络、模型版本、价格影响。
-- 真实外部模型 Provider、macOS Seatbelt 未在本机验证；P6 改动未提交，macOS CI 结果待提交后确认。
+- 真实外部模型 Provider 未验证；macOS Seatbelt 由 CI 测试覆盖，但未做人工实机操作验证。
 - Python Plugin/外部 Hook 仍不是沙箱；MCP 子进程不受 Bear Sandbox/Claim/Recovery 管理。
 
 ## 5. 下一阶段建议
