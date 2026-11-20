@@ -41,6 +41,7 @@ def _clear_env(monkeypatch: pytest.MonkeyPatch) -> None:
         "BEAR_CONTEXT_WINDOW",
         "BEAR_PERMISSION_MODE",
         "BEAR_SYSTEM_PROMPT_EXTRA",
+        "BEAR_FALLBACK_MODELS",
     ):
         monkeypatch.delenv(name, raising=False)
 
@@ -155,6 +156,101 @@ max_task_turns = 5
     assert "[checkpoints]" in rendered
     assert "[recovery]" in rendered
     assert "[tasks]" in rendered
+
+
+def test_hooks_mcp_and_plugins_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _clear_env(monkeypatch)
+    path = tmp_path / "config.toml"
+    path.write_text(
+        TOML
+        + """
+[hooks]
+enabled = true
+allow_external = true
+
+[[hooks.commands]]
+id = "audit-tool"
+event = "before_tool_call"
+command = "python"
+args = ["hook.py"]
+fail_mode = "closed"
+
+[mcp]
+enabled = true
+
+[mcp.servers.echo]
+transport = "stdio"
+command = "python"
+args = ["-m", "echo_server"]
+trusted = true
+
+[plugins]
+enabled = true
+allow_python = false
+""",
+        encoding="utf-8",
+    )
+    settings = load_settings(path)
+    assert settings.hooks.allow_external is True
+    assert settings.hooks.commands[0].id == "audit-tool"
+    assert settings.mcp.servers["echo"].trusted is True
+    assert settings.plugins.allow_python is False
+    rendered = settings_to_toml(settings)
+    assert "[hooks]" in rendered
+    assert "[mcp]" in rendered
+    assert "[plugins]" in rendered
+
+
+def test_untrusted_mcp_server_rejected(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _clear_env(monkeypatch)
+    path = tmp_path / "config.toml"
+    path.write_text(
+        TOML
+        + """
+[mcp.servers.echo]
+transport = "stdio"
+command = "python"
+trusted = false
+""",
+        encoding="utf-8",
+    )
+    with pytest.raises(ConfigError, match="not trusted"):
+        load_settings(path)
+
+
+def test_unknown_fallback_provider_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _clear_env(monkeypatch)
+    path = tmp_path / "config.toml"
+    path.write_text(
+        TOML.replace(
+            "max_turns = 7",
+            'max_turns = 7\nfallback_models = ["missing:model"]',
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(ConfigError, match="unknown provider"):
+        load_settings(path)
+
+
+def test_mcp_loopback_http_rejects_lookalike_host(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _clear_env(monkeypatch)
+    path = tmp_path / "config.toml"
+    path.write_text(
+        TOML
+        + """
+[mcp.servers.lookalike]
+transport = "streamable_http"
+url = "http://127.0.0.1.attacker.example/mcp"
+trusted = true
+""",
+        encoding="utf-8",
+    )
+    with pytest.raises(ConfigError, match="must use https"):
+        load_settings(path)
 
 
 def test_invalid_trigger_ratio_rejected(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

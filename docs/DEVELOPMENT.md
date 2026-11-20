@@ -37,6 +37,9 @@ src/bear_agent/
   storage/       Database、迁移、Repository、continuity_repositories
   sessions/      SessionRecord、SessionService、租约、Checkpoint、Recovery、Fork、Claims
   tasks/         Plan/Task/Todo 模型、状态机、TaskService、Planner、Verifier、Engine、Tools
+  hooks/         生命周期 Hook、外部命令 Hook、执行策略
+  mcp/           MCP Client/Manager、Tool 适配、信任与生命周期
+  plugins/       Manifest、PluginManager、PluginContext、状态
   providers/     ModelProvider 端口、OpenAI 兼容适配器、重试
   tools/         Tool 契约、注册表、执行器、builtin/（含 shell）
   shell/         命令策略、进程运行器、进程登记/恢复、环境、sandbox/
@@ -150,6 +153,16 @@ bear secret list            # 只看名称，不显示值
 - Task 工具只调用 TaskService，走 ToolExecutor；不要绕过权限、Claim、审计。
 - Context 注入使用 `TaskService.render_context`，保持 pinned；不要依赖 Prompt 来保存任务状态。
 - 测试：`uv run pytest tests/unit/test_tasks_service.py tests/unit/test_task_engine.py tests/unit/test_task_planner.py tests/unit/test_task_verifier.py tests/unit/test_task_tools.py tests/integration/test_task_runtime.py tests/integration/test_task_engine_runtime.py -q`。
+
+## Hooks / MCP / Plugins / Provider
+
+- Hook 只能在明确的前置事件修改上下文或否决工具；`tool_before` 在审批/Claim 之后运行，不允许修改参数。
+- 外部 Hook 默认关闭；新增外部执行必须无 shell、最小 env、超时/进程树清理、严格输出校验。
+- MCP Tool 必须经过 ToolExecutor；不要直接调用 MCP Session 绕过权限/审批/审计。Server 必须 trusted。
+- MCP 结果视为不可信输入；Schema 校验在本地执行；不要在 Provider/系统提示中拼接 MCP 内容。
+- Plugin 优先使用 Manifest 贡献 MCP/Hook；Python Plugin 需显式 `allow_python` + `permissions.python`，并说明无沙箱风险。
+- Provider 路由重试/切换只能在产生任何流事件之前；任何 partial stream 必须失败并保留诊断，禁止重放已输出 Tool Call。
+- 测试：`uv run pytest tests/unit/test_hooks.py tests/unit/test_mcp_tools.py tests/unit/test_plugins.py tests/unit/test_provider_router.py tests/integration/test_hooks_runtime.py tests/integration/test_mcp_runtime.py tests/integration/test_plugins_runtime.py tests/integration/test_provider_runtime_fallback.py -q`。
 
 ## 添加 Provider
 

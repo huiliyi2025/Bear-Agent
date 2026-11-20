@@ -85,6 +85,43 @@ def _parse_usage(raw: dict[str, Any] | None) -> TokenUsage | None:
     )
 
 
+def _error_from_payload(raw: object) -> ProviderError:
+    if isinstance(raw, dict):
+        message = str(raw.get("message") or raw.get("code") or "provider error")
+        code = str(raw.get("code") or raw.get("type") or "").lower()
+        status = raw.get("status")
+    else:
+        message = str(raw)
+        code = ""
+        status = None
+    category = "server_error"
+    if any(
+        marker in code or marker in message.lower()
+        for marker in (
+            "rate_limit",
+            "rate limit",
+            "insufficient_quota",
+            "quota",
+        )
+    ):
+        category = "rate_limit"
+    if any(
+        marker in code or marker in message.lower()
+        for marker in (
+            "context_length",
+            "context length",
+            "maximum context",
+        )
+    ):
+        category = "context_length"
+    return ProviderError(
+        message[:500],
+        category=category,
+        retryable=category in {"rate_limit", "server_error"},
+        status_code=int(status) if isinstance(status, int) else None,
+    )
+
+
 class OpenAICompatProvider(ModelProvider):
     def __init__(
         self,
@@ -161,7 +198,8 @@ class OpenAICompatProvider(ModelProvider):
                         response.raise_for_status()
                     except httpx.HTTPStatusError as exc:
                         raise classify_exception(exc) from exc
-                finish_reason = "stop"
+                finish_reason: str | None = None
+                saw_done = False
                 async for line in response.aiter_lines():
                     cancel.raise_if_cancelled()
                     if not line or line.startswith(":"):
@@ -172,6 +210,7 @@ class OpenAICompatProvider(ModelProvider):
                     if not data_text:
                         continue
                     if data_text == "[DONE]":
+                        saw_done = True
                         break
                     try:
                         chunk = json.loads(data_text)
@@ -181,6 +220,14 @@ class OpenAICompatProvider(ModelProvider):
                             category="malformed_response",
                             retryable=True,
                         ) from exc
+                    if not isinstance(chunk, dict):
+                        raise ProviderError(
+                            "malformed stream chunk: expected a JSON object",
+                            category="malformed_response",
+                            retryable=True,
+                        )
+                    if chunk.get("error") is not None:
+                        raise _error_from_payload(chunk.get("error"))
                     usage = _parse_usage(chunk.get("usage"))
                     if usage is not None:
                         yield UsageEvent(usage=usage)
@@ -212,10 +259,16 @@ class OpenAICompatProvider(ModelProvider):
                     chunk_finish = choice.get("finish_reason")
                     if chunk_finish:
                         finish_reason = str(chunk_finish)
+                if finish_reason is None and not saw_done:
+                    raise ProviderError(
+                        "provider stream ended before a finish reason or [DONE]",
+                        category="malformed_response",
+                        retryable=True,
+                    )
                 # Some providers put usage after the finish_reason chunk. Delaying
                 # Finish until the stream closes keeps Usage before Finish for
                 # deterministic consumers.
-                yield FinishEvent(reason=finish_reason)
+                yield FinishEvent(reason=finish_reason or "stop")
         except ProviderError:
             raise
         except Exception as exc:
@@ -248,6 +301,8 @@ class OpenAICompatProvider(ModelProvider):
         except Exception as exc:
             raise classify_exception(exc) from exc
 
+        if data.get("error") is not None:
+            raise _error_from_payload(data.get("error"))
         usage = _parse_usage(data.get("usage"))
         choices = data.get("choices") or []
         if not choices:

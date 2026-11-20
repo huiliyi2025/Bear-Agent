@@ -112,15 +112,16 @@ def make_container(
     scripts: list[list[ModelEvent]],
     *,
     approver: Approver | None = None,
-) -> tuple[Container, ScriptedProvider]:
-    provider = ScriptedProvider(scripts)
+    provider: ModelProvider | None = None,
+) -> tuple[Container, ModelProvider]:
+    chosen = provider or ScriptedProvider(scripts)
     container = build_container(
         settings,
         cwd=cwd,
         approver=approver or AutoApprover(),
-        provider=provider,
+        provider=chosen,
     )
-    return container, provider
+    return container, chosen
 
 
 async def new_session(container: Container, cwd: Path):

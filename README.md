@@ -6,7 +6,7 @@ Bear-Agent 把模型变成有边界、可观测的执行者：每次工具调用
 
 ## 当前状态
 
-**阶段 4（Task / Plan / Todo Engine）已完成。** 当前版本支持：
+**阶段 5（Hooks / MCP / Plugins / Provider Fallback）已完成。** 当前版本支持：
 
 - 在 OpenAI 兼容流式端点上运行异步 Agent Loop；
 - 执行 Shell 命令：超时、输出上限、进程树终止、取消；
@@ -23,9 +23,13 @@ Bear-Agent 把模型变成有边界、可观测的执行者：每次工具调用
 - Session Fork：从历史位置或 Checkpoint 派生独立会话，不继承执行状态与审批；
 - 持久化 Task / Plan / Todo：模型生成结构化计划、程序校验依赖/循环、版本化修订、依赖调度；
 - 任务执行接入真实 Runtime：独立完成验证、失败重试、阻塞、取消、恢复与副作用保护；
+- Hooks：Session/Run/Turn/Model/Tool/Task/Plan/Context/Checkpoint/Recovery 生命周期；进程内观察/否决/上下文扩展与外部命令 Hook；
+- MCP：官方协议 Client、stdio 与 Streamable HTTP、工具发现/命名空间/Schema 校验/超时/取消/重连，接入 ToolExecutor 安全链；
+- Plugin：Manifest、版本/依赖/权限校验、MCP/Hook/Tool 贡献、显式受信任 Python 入口、CLI 管理；
+- Provider Fallback：多 Provider/Model 路由、Retry/Backoff/Jitter/Retry-After、Circuit Breaker、流式安全（partial stream 不重放）；
 - CLI 流式输出文本与工具状态，或输出 NDJSON 给脚本。
 
-暂未实现（见 [ROADMAP.md](docs/ROADMAP.md)）：Hooks、MCP、插件、子代理、完整 TUI。
+暂未实现（见 [ROADMAP.md](docs/ROADMAP.md)）：Trace/评估、子代理、完整 TUI。
 
 ## 环境要求
 
@@ -99,6 +103,19 @@ bear tasks cancel <session-id> [--task <task-id>]
 ```
 
 交互模式下可使用 `/plan <goal>`、`/tasks`、`/run-plan`、`/task <id>`、`/cancel-plan`。
+
+扩展管理：
+
+```bash
+bear providers show                 # Primary / Fallback / 能力 / 重试策略
+bear providers test                 # 发送最小请求验证路由
+BEAR_FALLBACK_MODELS="backup:backup-model,other:model" bear run "..."
+bear mcp status                     # 连接已配置 MCP Server
+bear mcp tools                      # 列出 MCP 工具
+bear plugins list/validate/info ID  # Plugin 管理
+bear plugins enable/disable ID
+bear hooks list                     # Hook 配置
+```
 
 不修改配置文件，直接覆盖 Provider：
 

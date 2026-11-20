@@ -7,27 +7,36 @@ graph.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from bear_agent.artifacts.store import ArtifactStore
 from bear_agent.audit.service import AuditService
-from bear_agent.config.models import Settings
+from bear_agent.config.models import MCPConfig, Settings
 from bear_agent.context.anchors import AnchorLedger
 from bear_agent.context.builder import ContextBuilder
 from bear_agent.context.compaction import ContextCompactor
 from bear_agent.core.clock import SystemClock
+from bear_agent.core.events import EventType
 from bear_agent.core.fencing import LeaseFence
 from bear_agent.core.modes import PermissionMode
+from bear_agent.hooks.events import HookEvent
+from bear_agent.hooks.manager import HookManager
+from bear_agent.hooks.models import HookRegistration
+from bear_agent.mcp.manager import MCPManager
 from bear_agent.observability.bus import EventBus
 from bear_agent.observability.logging import install_redacting_filter
 from bear_agent.observability.recorder import EventRecorder
+from bear_agent.plugins.api import PluginContext, PluginLoadReport
+from bear_agent.plugins.manager import PluginManager
 from bear_agent.policy.approvals import ApprovalService
 from bear_agent.policy.approver import Approver, AutoApprover
 from bear_agent.policy.engine import PermissionEngine
 from bear_agent.policy.path_guard import PathGuard
 from bear_agent.providers.base import ModelProvider
-from bear_agent.providers.registry import create_provider
+from bear_agent.providers.router import FallbackProvider, build_fallback_provider
 from bear_agent.runtime.model_caller import ModelCaller
 from bear_agent.runtime.runtime import AgentRuntime
 from bear_agent.runtime.summarizer import ModelSummarizer
@@ -64,6 +73,8 @@ from bear_agent.tools.builtin import create_builtin_tools
 from bear_agent.tools.builtin.shell import BashTool
 from bear_agent.tools.executor import ToolExecutor
 from bear_agent.tools.registry import ToolRegistry
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -180,6 +191,7 @@ def build_maintenance(
 @dataclass
 class Container:
     settings: Settings
+    cwd: Path
     db: Database
     sessions: SessionService
     bus: EventBus
@@ -211,8 +223,74 @@ class Container:
     planner: PlanGenerator
     task_verifier: ModelTaskVerifier
     task_engine: TaskEngine | None
+    hooks: HookManager
+    mcp: MCPManager | None = None
+    plugins: PluginManager | None = None
+    plugin_report: PluginLoadReport | None = None
+    _hooks_unsubscribe: Any = None
+    _started: bool = False
+
+    async def startup(self) -> None:
+        """Load plugins and connect MCP servers."""
+        if self._started:
+            return
+        report: PluginLoadReport | None = None
+        if self.plugins is not None:
+            counter = 0
+
+            def hook_factory(**kwargs: Any) -> HookRegistration:
+                nonlocal counter
+                counter += 1
+                kwargs.setdefault("id", f"{kwargs.get('source', 'plugin')}:{counter}")
+                raw_events = kwargs.get("events") or []
+                kwargs["events"] = frozenset(
+                    event if isinstance(event, HookEvent) else HookEvent.from_string(str(event))
+                    for event in raw_events
+                )
+                return HookRegistration(**kwargs)
+
+            context = PluginContext.from_managers(
+                workspace=self.cwd,
+                hook_manager=self.hooks,
+                tool_registry=self.registry,
+            )
+            context.register_hook_command = getattr(self.hooks, "register_command", None)
+            context.hook_registration_factory = hook_factory
+            context.reserved_hook_ids = frozenset(
+                command.id for command in self.settings.hooks.commands
+            )
+            context.reserved_mcp_servers = frozenset(self.settings.mcp.servers)
+            context.reserved_tools = frozenset(self.registry.names())
+            report = await self.plugins.load(context)
+            self.plugin_report = report
+            for plugin_id, error in report.failed.items():
+                logger.warning("plugin %s failed: %s", plugin_id, error)
+
+        servers = dict(self.settings.mcp.servers)
+        if report is not None:
+            for contribution in report.contributions.values():
+                servers.update(contribution.mcp_servers)
+        if servers:
+            mcp_config = MCPConfig(enabled=self.settings.mcp.enabled, servers=servers)
+            manager = MCPManager(
+                mcp_config,
+                self.registry,
+                workspace=self.cwd,
+                server_cwd=self.settings.ensure_data_dirs() / "mcp",
+                redactor=self.redactor,
+                secret_store=self.secrets.store,
+            )
+            await manager.start()
+            self.mcp = manager
+        self._started = True
 
     async def close(self) -> None:
+        if self.mcp is not None:
+            await self.mcp.stop()
+        if self.plugins is not None:
+            await self.plugins.unload_all()
+        if self._hooks_unsubscribe is not None:
+            self._hooks_unsubscribe()
         try:
             await self.provider.aclose()
         finally:
@@ -236,16 +314,64 @@ def build_container(
         redactor = SecretRedactor()
         secret_store = secret_store_from_config(settings.secrets.backend)
         secrets = SecretManager(secret_store, SecretNameRepository(db), redactor)
-        model_provider = provider or create_provider(settings, secret_store=secret_store)
+        install_redacting_filter(redactor)
+        recorder = EventRecorder(sessions, event_bus, redactor)
+        audit = AuditService(db, redactor=redactor, clock=clock, enabled=settings.audit.enabled)
+
+        provider_event_types = {
+            "provider.selected": EventType.PROVIDER_SELECTED,
+            "provider.retry": EventType.PROVIDER_RETRY,
+            "provider.fallback": EventType.PROVIDER_FALLBACK,
+            "provider.circuit.open": EventType.PROVIDER_CIRCUIT_OPEN,
+            "provider.failed": EventType.PROVIDER_FAILED,
+        }
+
+        async def provider_event(event: str, payload: dict[str, object]) -> None:
+            # Provider routing events are diagnostic; session-scoped events are
+            # recorded when the request carries session metadata. Never log
+            # secrets: the router already redacted the payload.
+            safe = redactor.redact_obj(payload)
+            logger.info("provider event %s: %s", event, safe)
+            session_id = safe.get("session_id")
+            event_type = provider_event_types.get(event)
+            if isinstance(session_id, str) and event_type is not None:
+                run_id = safe.get("run_id")
+                await recorder.record(
+                    session_id,
+                    event_type,
+                    run_id=run_id if isinstance(run_id, str) else None,
+                    payload=safe,
+                )
+
+        if provider is not None:
+            model_provider = provider
+        else:
+            model_provider = build_fallback_provider(
+                settings,
+                secret_store=secret_store,
+                on_event=provider_event,
+            )
         try:
             provider_key = settings.provider().resolve_api_key(secret_store)
         except Exception:
             provider_key = ""
         if provider_key:
             redactor.register(f"provider:{settings.agent.default_provider}", provider_key)
-        install_redacting_filter(redactor)
-        recorder = EventRecorder(sessions, event_bus, redactor)
-        audit = AuditService(db, redactor=redactor, clock=clock, enabled=settings.audit.enabled)
+        if isinstance(model_provider, FallbackProvider):
+            for route in model_provider.routes:
+                route_config = getattr(route.provider, "config", None)
+                try:
+                    route_key = (
+                        route_config.resolve_api_key(secret_store)
+                        if route_config is not None
+                        else ""
+                    )
+                except Exception:
+                    continue
+                if route_key:
+                    redactor.register(f"provider:{route.name}", route_key)
+            for issue in model_provider.configuration_errors:
+                logger.warning("provider route skipped: %s", redactor.redact_obj(issue))
         task_service = TaskService(
             db,
             recorder,
@@ -253,6 +379,21 @@ def build_container(
             config=settings.tasks,
             clock=clock,
             redactor=redactor,
+        )
+        hooks = HookManager(
+            config=settings.hooks,
+            recorder=recorder,
+            audit=audit,
+            redactor=redactor,
+            workspace=Path(cwd).resolve(),
+            safe_cwd=data_dir / "hooks",
+        )
+        hooks_unsubscribe = event_bus.subscribe(hooks.on_bus_event)
+        plugin_manager = PluginManager(
+            settings.plugins,
+            data_dir=data_dir,
+            hooks_allow_external=settings.hooks.allow_external,
+            hooks_enabled=settings.hooks.enabled,
         )
 
         artifact_repository = ArtifactRepository(db)
@@ -332,6 +473,7 @@ def build_container(
             audit=audit,
             redactor=redactor,
             claims=claims if settings.claims.enabled else None,
+            hooks=hooks,
         )
         context_builder = ContextBuilder(
             cwd=cwd,
@@ -412,6 +554,7 @@ def build_container(
             recorder=recorder,
             compactor=compactor,
             tasks=task_service,
+            hooks=hooks,
             model=settings.agent.default_model,
             provider_name=settings.agent.default_provider,
             temperature=settings.agent.temperature,
@@ -452,6 +595,7 @@ def build_container(
         )
         return Container(
             settings=settings,
+            cwd=Path(cwd).resolve(),
             db=db,
             sessions=sessions,
             bus=event_bus,
@@ -483,6 +627,9 @@ def build_container(
             planner=planner,
             task_verifier=task_verifier,
             task_engine=task_engine,
+            hooks=hooks,
+            plugins=plugin_manager,
+            _hooks_unsubscribe=hooks_unsubscribe,
         )
     except BaseException:
         db.close()

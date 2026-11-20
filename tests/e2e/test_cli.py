@@ -357,6 +357,92 @@ def test_tasks_run_json_and_unknown_session_exit_codes(
     assert plan_result["tasks_completed"] == 1
 
 
+def test_providers_show_and_plugins_cli(tmp_path: Path) -> None:
+    runner = CliRunner()
+    plugin_dir = tmp_path / "my_plugins" / "demo"
+    plugin_dir.mkdir(parents=True)
+    (plugin_dir / "plugin.toml").write_text(
+        """
+schema_version = 1
+id = "demo"
+name = "Demo"
+version = "1.0.0"
+requires_bear = ">=0.4.0,<0.6.0"
+description = "test plugin"
+enabled_by_default = false
+
+[permissions]
+mcp = true
+
+[mcp_servers.calc]
+transport = "stdio"
+command = "python"
+args = ["-m", "demo_server"]
+trusted = true
+""",
+        encoding="utf-8",
+    )
+    config = _config(tmp_path)
+    with config.open("a", encoding="utf-8") as handle:
+        handle.write(f'\n[plugins]\nenabled = true\ndirs = ["{plugin_dir.parent.as_posix()}"]\n')
+
+    providers = runner.invoke(main.app, ["providers", "show", "--config", str(config)])
+    assert providers.exit_code == 0, providers.output
+    assert "fake" in providers.output
+    assert "fallback_enabled" in providers.output
+    assert "test" not in providers.output  # api key must not leak
+
+    listed = runner.invoke(main.app, ["plugins", "list", "--config", str(config)])
+    assert listed.exit_code == 0, listed.output
+    assert "demo" in listed.output
+    assert "no" in listed.output  # disabled by default
+
+    validated = runner.invoke(main.app, ["plugins", "validate", "--config", str(config)])
+    assert validated.exit_code == 0, validated.output
+    assert "ok" in validated.output
+
+    enabled = runner.invoke(main.app, ["plugins", "enable", "demo", "--config", str(config)])
+    assert enabled.exit_code == 0, enabled.output
+    listed_again = runner.invoke(main.app, ["plugins", "list", "--config", str(config)])
+    assert listed_again.exit_code == 0, listed_again.output
+
+
+def test_mcp_cli_with_real_stdio_server(tmp_path: Path) -> None:
+    import sys
+
+    server_script = Path(__file__).resolve().parents[1] / "support" / "mcp_server.py"
+    config = _config(tmp_path)
+    with config.open("a", encoding="utf-8") as handle:
+        handle.write(
+            "\n[mcp.servers.calc]\n"
+            'transport = "stdio"\n'
+            f'command = "{sys.executable.replace(chr(92), "/")}"\n'
+            f'args = ["{str(server_script).replace(chr(92), "/")}"]\n'
+            "trusted = true\n"
+            "required = true\n"
+            "timeout_s = 20\n"
+            "startup_timeout_s = 20\n"
+        )
+    runner = CliRunner()
+    tools = runner.invoke(main.app, ["mcp", "tools", "--config", str(config)])
+    assert tools.exit_code == 0, tools.output
+    assert "mcp__calc__echo" in tools.output
+    status = runner.invoke(main.app, ["mcp", "status", "--config", str(config)])
+    assert status.exit_code == 0, status.output
+    assert "ready" in status.output
+
+
+def test_mcp_and_hooks_cli_without_servers(tmp_path: Path) -> None:
+    runner = CliRunner()
+    config = _config(tmp_path)
+    mcp = runner.invoke(main.app, ["mcp", "status", "--config", str(config)])
+    assert mcp.exit_code == 0, mcp.output
+    assert "MCP servers" in mcp.output
+    hooks = runner.invoke(main.app, ["hooks", "list", "--config", str(config)])
+    assert hooks.exit_code == 0, hooks.output
+    assert "Hooks" in hooks.output
+
+
 def test_secret_commands_with_in_memory_store(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -398,6 +484,12 @@ headers = {{ Authorization = "Bearer leaky-token" }}
 [shell]
 env = {{ MY_SECRET = "leaky-secret" }}
 
+[mcp.servers.leaky]
+transport = "stdio"
+command = "python"
+env = {{ MCP_TOKEN = "mcp-leaky-secret" }}
+trusted = true
+
 [storage]
 data_dir = "{data_dir}"
 """,
@@ -407,6 +499,7 @@ data_dir = "{data_dir}"
     result = runner.invoke(main.app, ["config", "show", "--json", "--config", str(config)])
     assert result.exit_code == 0, result.output
     assert "leaky-secret" not in result.output
+    assert "mcp-leaky-secret" not in result.output
     assert "leaky-token" not in result.output
     plain = runner.invoke(main.app, ["config", "show", "--config", str(config)])
     assert plain.exit_code == 0, plain.output

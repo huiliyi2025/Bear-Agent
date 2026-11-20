@@ -29,9 +29,11 @@ from bear_agent.core.errors import (
     ToolExecutionError,
 )
 from bear_agent.core.events import EventType
+from bear_agent.core.fencing import LeaseFence
 from bear_agent.core.ids import new_id
 from bear_agent.core.messages import ToolCall
 from bear_agent.core.modes import PermissionMode
+from bear_agent.hooks.manager import HookManager
 from bear_agent.observability.recorder import EventRecorder
 from bear_agent.policy.approvals import ApprovalService, approval_fingerprint
 from bear_agent.policy.engine import PermissionEngine
@@ -66,6 +68,7 @@ class ToolExecutor:
         audit: AuditService | None = None,
         redactor: SecretRedactor | None = None,
         claims: ClaimService | None = None,
+        hooks: HookManager | None = None,
         max_output_chars: int = 24_000,
     ) -> None:
         self.registry = registry
@@ -77,6 +80,7 @@ class ToolExecutor:
         self.audit = audit
         self.redactor = redactor or SecretRedactor()
         self.claims = claims
+        self.hooks = hooks
         self.max_output_chars = max_output_chars
 
     async def execute(
@@ -335,6 +339,25 @@ class ToolExecutor:
                 await claims.assert_owned(session_id, lease_owner, path)
 
             ctx.assert_write_allowed = assert_write_allowed
+
+        if self.hooks is not None:
+            hook_outcome = await self.hooks.before_tool_call(
+                tool_name=call.name,
+                arguments=safe_arguments,
+                session_id=session_id,
+                run_id=run_id,
+                turn_id=turn_id,
+                fence=(LeaseFence(lease_owner, lease_epoch) if lease_epoch is not None else None),
+            )
+            if hook_outcome.denied or hook_outcome.failed_closed:
+                return await self._fail(
+                    session_id,
+                    run_id,
+                    turn_id,
+                    call,
+                    "hook_denied" if hook_outcome.denied else "hook_failed_closed",
+                    hook_outcome.reason or "tool call denied by hook policy",
+                )
 
         started = time.monotonic()
         try:

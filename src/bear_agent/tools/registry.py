@@ -14,12 +14,21 @@ class ToolRegistry:
     def __init__(self) -> None:
         self._tools: dict[str, Tool] = {}
 
-    def register(self, tool: Tool) -> None:
+    def register(self, tool: Tool, *, replace: bool = False) -> None:
         if not tool.name:
             raise ValueError("tool name must not be empty")
-        if tool.name in self._tools:
+        if tool.name in self._tools and not replace:
             raise ValueError(f"tool already registered: {tool.name}")
         self._tools[tool.name] = tool
+
+    def unregister(self, name: str) -> Tool | None:
+        return self._tools.pop(name, None)
+
+    def unregister_prefix(self, prefix: str) -> list[str]:
+        names = [name for name in self._tools if name.startswith(prefix)]
+        for name in names:
+            self._tools.pop(name, None)
+        return names
 
     def get(self, name: str) -> Tool | None:
         return self._tools.get(name)

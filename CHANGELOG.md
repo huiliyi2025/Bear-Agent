@@ -2,6 +2,40 @@
 
 记录所有重要变更。项目按阶段路线图推进；公开版本发布后使用语义化版本。
 
+## [0.5.0] — 2026-11-20 — 阶段 5：Hooks / MCP / Plugins / Provider Fallback
+
+### 新增
+
+- Hooks 生命周期：session/run/turn/model/tool/task/plan/context/checkpoint/recovery/terminal 事件；进程内 Pre/Post 与观察 Hook。
+- Hook 执行语义：优先级顺序、超时、取消、fail-open/fail-closed、递归/深度防护；`tool_before` 只能额外拒绝，`model_before` 只能追加有界脱敏上下文。
+- 外部命令 Hook：`create_subprocess_exec`（无 shell）、最小环境、有界 stdout、进程树终止、严格 JSON 输出；默认关闭，需 `hooks.allow_external=true`。
+- Hook 事件、审计、CLI `hooks list`。
+- MCP Client：官方 `mcp>=2.3,<3`；stdio 与 Streamable HTTP；初始化/能力/工具发现/调用/超时/取消/重连/停止；多 Server 命名空间与冲突检测。
+- MCP Tools 接入 ToolRegistry/ToolExecutor：原始 JSON Schema、jsonschema 参数校验、EXEC 审批、结果转换/脱敏/截断、不可信内容边界；required/optional Server 策略。
+- Plugin Framework：`plugin.toml` Manifest、版本/`requires_bear`/依赖/权限/冲突校验；声明式 MCP Server 与外部 Hook；可选受信任 Python 入口（双重显式开关）；状态文件启停；CLI `plugins list/info/validate/enable/disable`。
+- Provider Router：有序 Primary/Fallback 路由、错误分类、Retry-After/backoff/jitter、Retry Budget、能力兼容、Circuit Breaker、half-open 恢复。
+- 流式安全：只有尚未产生任何事件时才重试/切换；partial stream 返回结构化诊断，绝不重放已输出文本或已执行 Tool Call。
+- Provider 实际 route 记录到 ModelResponse/model_calls/事件；CLI `providers show`/`test`；`BEAR_FALLBACK_MODELS`。
+- Container 异步 `startup`：加载 Plugin、合并 MCP Server、连接并注册工具；CLI run/chat/task 与 `mcp status/tools` 接入。
+- 配置 `[hooks]`、`[mcp]`、`[plugins]` 与 Provider fallback/circuit 字段。
+
+### 安全
+
+- Hook 不能 allow/修改工具参数/绕过审批；外部 Hook 明确为用户权限进程。
+- MCP Server 必须显式 trusted；stdio 不经 shell；HTTP 仅 https（loopback 例外）；参数校验在本地完成；结果视为不可信。
+- Plugin Python 默认关闭，需 `plugins.allow_python` + `permissions.python`；无沙箱风险已文档化。
+- Provider 密钥注册到全局脱敏器；事件/状态不输出密钥/headers；partial stream 不重复副作用。
+- 所有扩展工具仍经过 PermissionEngine/Approval/Claim/Audit/Sandbox/Lease。
+
+### 已知限制
+
+- Python Plugin 与外部 Hook 在进程/用户权限下运行，不是沙箱。
+- MCP Server 子进程不受 Bear Shell Sandbox 约束、无文件 Claim；Recovery 不跟踪。
+- Circuit Breaker 为进程内状态；重启后重置。
+- 跨 Provider 能力差异仅支持 OpenAI-compatible 语义；非兼容 Provider 需 adapter。
+- partial stream 无法透明恢复，只能保留诊断。
+- 真实网络 Provider 未验证；使用 respx/本地 MCP Server 验证。
+
 ## [0.4.0] — 2026-11-20 — 阶段 4：Task / Plan / Todo Engine
 
 ### 新增

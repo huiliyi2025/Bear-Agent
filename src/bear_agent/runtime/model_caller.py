@@ -42,6 +42,8 @@ class ModelResponse:
     usage: TokenUsage
     finish_reason: str
     latency_ms: int
+    provider_name: str = ""
+    model: str = ""
 
 
 @dataclass
@@ -78,6 +80,8 @@ class ModelCaller:
         async for event in self.provider.stream(request, cancel):
             await self._consume(event, aggregate, on_text_delta, on_thinking_delta)
         latency_ms = int((time.monotonic() - started) * 1000)
+        route = getattr(self.provider, "last_route", None)
+        route_provider, route_model = route if isinstance(route, tuple) else ("", "")
         calls = [
             self._finalize_call(index, buffer) for index, buffer in sorted(aggregate.calls.items())
         ]
@@ -93,6 +97,8 @@ class ModelCaller:
             usage=aggregate.usage,
             finish_reason=aggregate.finish_reason,
             latency_ms=latency_ms,
+            provider_name=str(route_provider or ""),
+            model=str(route_model or ""),
         )
 
     async def _consume(

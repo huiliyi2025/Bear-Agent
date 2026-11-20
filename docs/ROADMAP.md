@@ -11,8 +11,8 @@
 | P2 | Shell 执行与执行安全 | **已完成** |
 | P3 | 上下文压缩 + Checkpoint + 恢复 | **已完成** |
 | P4 | 持久化 Task / Plan / Todo 引擎 | **已完成** |
-| P5 | Hooks、插件、MCP、Provider Fallback | 下一阶段 |
-| P6 | 可观测性、Trace、评估 | 计划中 |
+| P5 | Hooks、插件、MCP、Provider Fallback | **已完成** |
+| P6 | 可观测性、Trace、评估 | 下一阶段 |
 | P7 | TUI、打包、发布工程 | 计划中 |
 | P8 | Server/Web UI、多会话、子代理 | 可选 |
 
@@ -232,12 +232,33 @@
 - Fork 不继承 Plan/Task；需要重新规划。
 - Transcript 会累积每个任务的 prompt 与结果，长 Plan 依赖压缩。
 
-## P5——可扩展性
+## P5——Hooks / MCP / Plugins / Provider Fallback（已完成）
 
-- Interceptor/Observer Hooks、外部命令 Hook、项目信任。
-- Python entry-point 插件与示例。
-- MCP 客户端、工具命名空间、能力策略、健康检查/重启。
-- Provider Fallback、多 Provider、能力矩阵。
+> 完成报告：[P5-COMPLETION-REPORT.md](P5-COMPLETION-REPORT.md)。
+
+### 已交付
+
+- Hooks：精简生命周期事件、进程内观察/前置 Hook、外部命令 Hook、优先级/超时/取消/fail-open/closed、递归防护、事件与审计。
+- MCP：官方 SDK 2.x、stdio 与 Streamable HTTP、初始化/发现/调用/超时/取消/重连/停止、多 Server、命名空间、Schema 校验、ToolExecutor 集成。
+- Plugins：Manifest、版本/依赖/权限/冲突校验、MCP/Hook 贡献、受信任 Python 入口、状态启停、CLI。
+- Provider：Primary/Fallback 路由、错误分类、Retry/Backoff/Jitter/Retry-After、Circuit Breaker、能力兼容、partial stream 安全、实际 route 记录、CLI。
+- Container 异步启动与 CLI 集成；配置与安全文档。
+
+### 验收证据
+
+- Hook 拒绝写入、上下文追加、fail-closed、观察事件通过真实 Runtime/ToolExecutor 测试。
+- 真实 stdio MCP Server 与真实 in-process Streamable HTTP Server 测试：发现、调用、错误、超时、取消、重连、多 Server、冲突、权限/审批、CLI。
+- Plugin 声明式 MCP Server、Python Tool、Python Hook、默认禁用、冲突/依赖/版本测试；CLI E2E。
+- Provider：Retry、Fallback、partial stream、Circuit、能力、工具调用只执行一次、Task Engine 协同、真实 Runtime/respx 测试。
+- 全量 pytest、ruff、format、mypy、build 通过（见 P5 Completion Report）。
+
+### 已知限制
+
+- Python Plugin/外部 Hook 是用户权限进程，不是沙箱。
+- MCP 子进程不受 Bear Sandbox/Claim/Recovery 管理。
+- Circuit Breaker 进程内；重启重置。
+- 真实外部 Provider 网络未在测试中验证；跨厂商差异需 adapter。
+- partial stream 只能失败并诊断，不能透明恢复。
 
 ## P6——可观测性与评估
 

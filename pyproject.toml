@@ -1,12 +1,15 @@
 [project]
 name = "bear-agent"
-version = "0.4.0"
+version = "0.5.0"
 description = "Bear-Agent——本地优先、可恢复、可扩展的 Agent Harness。"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
     "httpx>=0.28.0",
+    "jsonschema>=4.26.0",
     "keyring>=25.0.0",
+    "mcp>=2.3,<3",
+    "packaging>=26.3",
     "platformdirs>=4.3.0",
     "pydantic>=2.10.0",
     "pydantic-settings>=2.16.2",

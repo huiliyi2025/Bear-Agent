@@ -1,0 +1,37 @@
+# Example manifest-only plugin: one stdio MCP server.
+#
+# This directory is a template, not something Bear-Agent loads by default.
+# Copy it under a discovery directory (for example
+# <data_dir>/plugins/example_mcp/) and review every command before enabling it.
+#
+# `trusted = true` is an explicit statement that you trust this executable to
+# run with your OS privileges. Never copy this file from untrusted sources and
+# never set trusted=true for a command you have not inspected.
+
+schema_version = 1
+id = "example_mcp"
+name = "Example MCP server"
+version = "0.1.0"
+description = "Demonstrates a manifest-only plugin that contributes one stdio MCP server."
+author = "Bear-Agent examples"
+requires_bear = ">=0.4.0,<0.6.0"
+homepage = "https://example.invalid/bear-agent/plugins/example_mcp"
+
+# Not loaded unless the user enables it with `bear plugin enable example_mcp`
+# or sets enabled_by_default = true in a trusted local copy.
+enabled_by_default = false
+
+[permissions]
+# The manifest below contributes an MCP server, so this is required.
+mcp = true
+
+[mcp_servers.example_docs]
+transport = "stdio"
+command = "python"
+args = ["-m", "example_mcp_server"]
+enabled = true
+# Required for every enabled server. Review the command above first.
+trusted = true
+required = true
+timeout_s = 60.0
+startup_timeout_s = 20.0

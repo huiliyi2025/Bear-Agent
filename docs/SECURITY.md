@@ -1,6 +1,6 @@
 # 安全
 
-> 阶段 4 范围。本文说明当前已经强制实施的控制，以及尚未实现的控制。
+> 阶段 5 范围。本文说明当前已经强制实施的控制，以及尚未实现的控制。
 > 不要把推迟项当作已实现。
 
 ## 威胁模型
@@ -18,7 +18,7 @@ Bear-Agent 假设模型可能出错、被操纵，甚至主动对抗：
 
 **信任边界是运行时，不是 Prompt。**
 
-## 已实施控制（阶段 4）
+## 已实施控制（阶段 5）
 
 ### 权限模式与审批
 
@@ -36,7 +36,7 @@ Bear-Agent 假设模型可能出错、被操纵，甚至主动对抗：
   - project：持久化，按项目/cwd 作用域，会过期。
 - 一次授权不会授权其他命令或其他工具调用。
 - 审批决策会写入事件与审计。
-- 无 TTY 的无头运行使用拒绝型 approver。
+- 无 TTY 的无头运行使用拒绝型 approver；`tasks run/resume` 只有显式 `--yes` 或交互 TTY 才自动/交互审批 EXEC 工具。
 
 ### Shell 命令策略
 
@@ -152,6 +152,39 @@ Bear-Agent 假设模型可能出错、被操纵，甚至主动对抗：
 - Checkpoint 的 tasks 快照在同一事务读取并脱敏；Fork 不复制 Plan/Task/Attempt，避免继承未经重新验证的完成状态。
 - Task/Plan/Todo 上下文作为 pinned system 块注入，压缩 L1-L4 不会移除。
 
+### Hooks
+
+- `tool_before` 在 PermissionEngine、审批、Claim 之后运行，只能**额外拒绝**，不能 allow、不能修改参数；不能绕过安全链。
+- `model_before` 只能追加上限内、脱敏的 pinned 上下文，不能删除安全指令。
+- 超时（默认 5s）、取消传播、fail-open/closed、深度/同事件递归防护；Hook 事件与审计脱敏。
+- 外部命令 Hook 默认关闭，需 `hooks.allow_external=true`；`create_subprocess_exec` 无 shell、最小环境、有界输出、超时杀进程树；默认 cwd 是数据目录下的安全目录而非 Agent 可写工作区；外部 Hook 不能追加上下文。
+- 进程内 Python Hook 是受信任代码，拥有用户权限；由 Plugin 权限与全局开关控制。
+
+### MCP
+
+- 每个 enabled Server 必须显式 `trusted=true`；默认没有 Server。
+- stdio 不经 shell、最小环境 + 显式 env；默认 cwd 是数据目录下的安全目录，不在 Agent 可写工作区解析相对模块；Streamable HTTP 仅 https（loopback 精确 IP/主机名）、拒绝 URL 内嵌凭证。
+- 工具命名空间 `mcp__server__tool`；原始 Schema 在本地用 jsonschema 校验，非法参数不发送。
+- MCP Tool 为 EXEC、非幂等：必须经过权限/审批；Task 失败不会自动重试执行过 MCP 工具的任务；不会在调用内自动重放。
+- 经 ToolExecutor 产生 Audit、超时、取消、结果脱敏；MCP 返回内容按不可信工具输出处理。
+- 子进程生命周期由 MCPManager 管理；required 启动失败 fail-closed。
+
+### Plugins
+
+- Manifest 校验 ID/版本/`requires_bear`/依赖/权限/贡献冲突；依赖拓扑与循环检测。
+- Manifest-only Plugin 不执行代码；MCP Server 仍需自身 trusted，外部 Hook 仍需 allow_external。
+- Python Plugin 默认关闭；需 `plugins.allow_python=true` + `permissions.python=true`，加载到主进程、无沙箱（风险文档化）。
+- 贡献先 staging 校验再提交，冲突/失败不留下部分注册；状态文件只含布尔开关。
+- Plugin Tool 仍经过 ToolExecutor；Plugin Hook 遵守 Hook 的只读/否决边界。
+
+### Provider Fallback / Retry
+
+- 重试/切换只发生在尚未产生任何流事件时；partial stream 失败不重放，避免重复文本/Tool Call。
+- Retry Budget、backoff/jitter、Retry-After、取消；Circuit Breaker 防雪崩。
+- 错误与状态快照经 SecretRedactor；fallback route API key 也注册到全局脱敏器。
+- 实际使用的 provider/model 记录到 Model Call 和事件，避免追溯错误。
+- invalid_request 不重试/不切换；context_length 只切到更大 context 的 route。
+
 ### 工具执行
 
 - 执行前进行 JSON Schema 校验；非法参数不会到达工具。
@@ -184,6 +217,16 @@ Hardening 后的残余风险：
 - keyring set/get 通过后端选择/拒绝逻辑测试；当前测试环境没有写入用户真实 Credential Manager。
 - macOS Seatbelt profile/deny 规则有单元测试，但当前环境未验证实际执行。
 
+### 阶段 5 残余风险
+
+- 进程内 Python Plugin 与外部 Hook 在用户权限下运行，不是沙箱；只能靠显式信任/开关。
+- MCP Server 子进程不受 Bear Shell Sandbox、文件 Claim 或 Recovery 跟踪；父进程崩溃后的清理依赖 SDK/OS。
+- MCP 返回内容仍可能包含 Prompt Injection；仅作为工具输出处理，不能作为系统指令。
+- Circuit Breaker 是进程内状态，重启重置；多进程不共享健康状态。
+- 部分流失败无法透明恢复，必须保留诊断并结束当前请求。
+- SSE 事件一旦发布到 UI，即使请求最终失败，用户已看到部分输出；不会进入持久化 assistant 消息。
+- 真实第三方 Provider 网络/差异未在测试环境验证。
+
 ### 阶段 4 残余风险
 
 - 模型 verifier 仍可能误判任务完成或遗漏验收标准；evidence 模式只检查证据存在，不判断语义质量。
@@ -208,7 +251,7 @@ Hardening 后的残余风险：
 |---|---|---|
 | Windows 文件系统隔离（AppContainer/restricted token） | 后续 | 已评估但未交付；Windows Job Object 仅进程级，`require` 默认阻止 Shell |
 | MCP 信任与能力策略 | P5 | MCP 尚未实现 |
-| Prompt Injection 污点追踪 | P5 | 不可信输出未作为数据流追踪；压缩/规划/验证 prompt 仅做边界声明 |
+| Prompt Injection 污点追踪 | P6 | 不可信输出未作为数据流追踪；压缩/规划/验证/MCP 仅做边界声明 |
 | 外部审计锚点/签名 | 后续 | 本地哈希链可被数据库写者重算 |
 | 静态加密数据库 | 后续 | SQLite 在磁盘上为明文 |
 | 逐命令网络策略 | 后续 | Sandbox 网络是会话级全开/全关 |

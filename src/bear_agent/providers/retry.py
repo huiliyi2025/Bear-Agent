@@ -12,6 +12,8 @@ import asyncio
 import random
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
+from datetime import datetime
+from email.utils import parsedate_to_datetime
 
 import httpx
 
@@ -37,8 +39,19 @@ def classify_exception(exc: BaseException) -> ProviderError:
                 status_code=status,
                 retry_after_s=retry_after,
             )
-        if status in (401, 403):
+        body = _safe_body(exc.response).lower()
+        context_markers = (
+            "context_length_exceeded",
+            "maximum context length",
+            "context window",
+            "prompt is too long",
+            "too many tokens",
+            "reduce the length",
+        )
+        if status in (401, 402, 403):
             category = "auth"
+        elif status == 400 and any(marker in body for marker in context_markers):
+            category = "context_length"
         elif status == 400:
             category = "invalid_request"
         elif status == 404:
@@ -55,7 +68,13 @@ def classify_exception(exc: BaseException) -> ProviderError:
         )
     if isinstance(exc, (httpx.TimeoutException, asyncio.TimeoutError)):
         return ProviderError("provider request timed out", category="timeout", retryable=True)
-    if isinstance(exc, (httpx.ConnectError, httpx.ReadError, httpx.RemoteProtocolError)):
+    if isinstance(exc, httpx.DecodingError):
+        return ProviderError(
+            f"provider response could not be decoded: {exc}",
+            category="malformed_response",
+            retryable=True,
+        )
+    if isinstance(exc, httpx.TransportError):
         return ProviderError(f"network error: {exc}", category="network", retryable=True)
     if isinstance(exc, OSError):
         return ProviderError(f"network error: {exc}", category="network", retryable=True)
@@ -69,6 +88,12 @@ def _retry_after_seconds(response: httpx.Response) -> float | None:
     try:
         return max(0.0, float(raw))
     except ValueError:
+        pass
+    try:
+        parsed = parsedate_to_datetime(raw)
+        now = datetime.now(parsed.tzinfo) if parsed.tzinfo else datetime.now()
+        return max(0.0, (parsed - now).total_seconds())
+    except (TypeError, ValueError, OverflowError):
         return None
 
 
@@ -88,9 +113,12 @@ class RetryPolicy:
 
     def delay_for(self, attempt: int, error: ProviderError) -> float:
         if error.retry_after_s is not None:
-            return min(self.max_delay_s, error.retry_after_s)
+            # The server explicitly asked us to wait; obey it rather than
+            # hammering early. Cancellation still interrupts the wait.
+            return max(0.0, error.retry_after_s)
         raw = min(self.max_delay_s, self.base_delay_s * (2 ** (attempt - 1)))
-        return float(raw * (1.0 + random.uniform(-self.jitter, self.jitter)))
+        jittered = raw * (1.0 + random.uniform(-self.jitter, self.jitter))
+        return float(max(0.0, min(self.max_delay_s, jittered)))
 
 
 class RetryingProvider(ModelProvider):

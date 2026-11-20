@@ -98,6 +98,33 @@ class EventType(StrEnum):
     TASK_RUN_FAILED = "task.run.failed"
     TASK_RECONCILED = "task.reconciled"
 
+    # Hooks
+    HOOK_STARTED = "hook.started"
+    HOOK_COMPLETED = "hook.completed"
+    HOOK_FAILED = "hook.failed"
+    HOOK_DENIED = "hook.denied"
+
+    # MCP
+    MCP_SERVER_STARTED = "mcp.server.started"
+    MCP_SERVER_FAILED = "mcp.server.failed"
+    MCP_SERVER_RECONNECTED = "mcp.server.reconnected"
+    MCP_SERVER_STOPPED = "mcp.server.stopped"
+    MCP_TOOLS_UPDATED = "mcp.tools.updated"
+
+    # Plugins
+    PLUGIN_LOADED = "plugin.loaded"
+    PLUGIN_UNLOADED = "plugin.unloaded"
+    PLUGIN_ENABLED = "plugin.enabled"
+    PLUGIN_DISABLED = "plugin.disabled"
+    PLUGIN_FAILED = "plugin.failed"
+
+    # Provider routing
+    PROVIDER_SELECTED = "provider.selected"
+    PROVIDER_RETRY = "provider.retry"
+    PROVIDER_FALLBACK = "provider.fallback"
+    PROVIDER_CIRCUIT_OPEN = "provider.circuit.open"
+    PROVIDER_FAILED = "provider.failed"
+
     # Ephemeral UI events
     MODEL_TEXT_DELTA = "model.text.delta"
     MODEL_THINKING_DELTA = "model.thinking.delta"
@@ -169,6 +196,25 @@ PERSISTED_EVENT_TYPES: frozenset[EventType] = frozenset(
         EventType.TASK_RUN_COMPLETED,
         EventType.TASK_RUN_FAILED,
         EventType.TASK_RECONCILED,
+        EventType.HOOK_STARTED,
+        EventType.HOOK_COMPLETED,
+        EventType.HOOK_FAILED,
+        EventType.HOOK_DENIED,
+        EventType.MCP_SERVER_STARTED,
+        EventType.MCP_SERVER_FAILED,
+        EventType.MCP_SERVER_RECONNECTED,
+        EventType.MCP_SERVER_STOPPED,
+        EventType.MCP_TOOLS_UPDATED,
+        EventType.PLUGIN_LOADED,
+        EventType.PLUGIN_UNLOADED,
+        EventType.PLUGIN_ENABLED,
+        EventType.PLUGIN_DISABLED,
+        EventType.PLUGIN_FAILED,
+        EventType.PROVIDER_SELECTED,
+        EventType.PROVIDER_RETRY,
+        EventType.PROVIDER_FALLBACK,
+        EventType.PROVIDER_CIRCUIT_OPEN,
+        EventType.PROVIDER_FAILED,
     }
 )
 

@@ -35,10 +35,18 @@ from bear_agent.config.loader import (
     write_default_config,
 )
 from bear_agent.config.models import Settings
+from bear_agent.core.cancel import CancelToken
 from bear_agent.core.errors import BearError, CheckpointError, TaskStateError
 from bear_agent.core.fencing import LeaseFence, reset_fence, set_fence
+from bear_agent.core.messages import SystemMessage, UserMessage
 from bear_agent.core.usage import TokenUsage
+from bear_agent.hooks.manager import HookManager
+from bear_agent.mcp.manager import MCPManager
+from bear_agent.plugins.manager import PluginManager
 from bear_agent.policy.approver import AutoApprover, DenyingApprover
+from bear_agent.providers.base import ModelRequest
+from bear_agent.providers.router import build_fallback_provider
+from bear_agent.runtime.model_caller import ModelCaller
 from bear_agent.runtime.stop_policy import RunStatus
 from bear_agent.secrets.redaction import SecretRedactor
 from bear_agent.secrets.store import SecretManager, secret_store_from_config
@@ -50,6 +58,7 @@ from bear_agent.storage.security_repositories import SecretNameRepository
 from bear_agent.tasks.models import PlanDraft, TaskStatus
 from bear_agent.tasks.service import TaskService
 from bear_agent.tools.builtin import create_builtin_tools
+from bear_agent.tools.registry import ToolRegistry
 from bear_agent.ui.cli.approvals import CliApprover
 from bear_agent.ui.cli.render import Renderer
 
@@ -79,11 +88,19 @@ tasks_app = typer.Typer(help="规划并执行多步骤任务。")
 config_app = typer.Typer(help="查看配置。")
 audit_app = typer.Typer(help="查看安全审计链。")
 secret_app = typer.Typer(help="管理 keyring 密钥。")
+providers_app = typer.Typer(help="查看与测试模型 Provider / Fallback。")
+plugins_app = typer.Typer(help="管理 Plugin。")
+mcp_app = typer.Typer(help="查看 MCP Server 与工具。")
+hooks_app = typer.Typer(help="查看 Hook。")
 app.add_typer(sessions_app, name="sessions")
 app.add_typer(tasks_app, name="tasks")
 app.add_typer(config_app, name="config")
 app.add_typer(audit_app, name="audit")
 app.add_typer(secret_app, name="secret")
+app.add_typer(providers_app, name="providers")
+app.add_typer(plugins_app, name="plugins")
+app.add_typer(mcp_app, name="mcp")
+app.add_typer(hooks_app, name="hooks")
 
 
 # --------------------------------------------------------------------- helpers
@@ -289,6 +306,10 @@ async def _chat(
         await container.secrets.hydrate_redactor()
     unsubscribe = container.bus.subscribe(Renderer(console=console))
     try:
+        try:
+            await container.startup()
+        except Exception as exc:
+            _fail(f"failed to start extensions: {exc}", code=1)
         try:
             session = await _open_session(
                 container, cwd, resume=resume, continue_latest=continue_latest
@@ -621,6 +642,10 @@ async def _run_once(
     renderer = Renderer(json_mode=json_output, console=console)
     unsubscribe = container.bus.subscribe(renderer)
     try:
+        try:
+            await container.startup()
+        except Exception as exc:
+            _fail(f"failed to start extensions: {exc}", code=1)
         try:
             session = await _open_session(container, cwd, resume=resume, continue_latest=False)
         except BearError as exc:
@@ -991,6 +1016,7 @@ async def _execute_plan(
     session_id: str,
     *,
     json_output: bool,
+    yes: bool = False,
 ) -> int:
     if not settings.tasks.enabled:
         _fail("task engine is disabled in configuration ([tasks].enabled=false)", code=2)
@@ -999,13 +1025,24 @@ async def _execute_plan(
     except ValueError as exc:
         _fail(str(exc), code=2)
     try:
-        container = build_container(settings, cwd=workspace)
+        container = build_container(
+            settings,
+            cwd=workspace,
+            approver=_make_approver(interactive=sys.stdin.isatty() and not json_output, yes=yes),
+        )
     except Exception as exc:
         _fail(f"failed to initialize Bear-Agent: {exc}", code=1)
         raise AssertionError("unreachable") from exc
     renderer = Renderer(json_mode=json_output, console=console)
     unsubscribe = container.bus.subscribe(renderer)
     try:
+        try:
+            await container.startup()
+        except Exception as exc:
+            console.print(
+                f"[red]failed to start extensions:[/red] {container.redactor.redact(str(exc))}"
+            )
+            return 1
         try:
             report = await container.runtime.run_plan(session_id)
         except ValueError as exc:
@@ -1057,6 +1094,7 @@ def tasks_plan(
     cwd: Path | None = typer.Option(None, "--cwd", "-C"),
     session: str | None = typer.Option(None, "--session", "-s", help="Existing session id."),
     run: bool = typer.Option(False, "--run", help="Execute the plan immediately."),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Auto-approve ASK tools while running."),
     json_output: bool = typer.Option(False, "--json", help="Emit NDJSON events while running."),
 ) -> None:
     """用模型生成结构化 Plan, 经程序校验后持久化."""
@@ -1138,7 +1176,11 @@ def tasks_plan(
                 await container.close()
                 raise typer.Exit(
                     code=await _execute_plan(
-                        settings, workspace, record.id, json_output=json_output
+                        settings,
+                        workspace,
+                        record.id,
+                        json_output=json_output,
+                        yes=yes,
                     )
                 )
         finally:
@@ -1198,6 +1240,7 @@ def tasks_run(
     config: Path | None = typer.Option(None, "--config"),
     cwd: Path | None = typer.Option(None, "--cwd", "-C"),
     json_output: bool = typer.Option(False, "--json", help="Emit NDJSON events."),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Auto-approve ASK tools."),
 ) -> None:
     """执行当前 Plan, 直到完成、阻塞或预算耗尽."""
     settings = _load(
@@ -1455,6 +1498,7 @@ def tasks_resume(
         "--force",
         help="Retry tasks whose last attempt used non-idempotent tools.",
     ),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Auto-approve ASK tools while running."),
 ) -> None:
     """恢复崩溃后的任务状态并重试可重试任务。"""
     settings = _load(
@@ -1545,8 +1589,12 @@ def config_show(
         for provider in data.get("providers", {}).values():
             provider.pop("api_key", None)
             provider.pop("headers", None)
-        # shell.env may contain user-supplied secrets; never print it.
+        # shell.env and MCP env/headers may contain user-supplied secrets;
+        # never print them.
         data.get("shell", {}).pop("env", None)
+        for server in (data.get("mcp", {}).get("servers") or {}).values():
+            server.pop("env", None)
+            server.pop("headers", None)
         console.print_json(json.dumps(data, ensure_ascii=False))
     else:
         console.print(settings_to_toml(settings), markup=False)
@@ -1556,6 +1604,448 @@ def config_show(
 def config_path() -> None:
     """输出默认配置路径。"""
     console.print(str(default_config_path()))
+
+
+# ------------------------------------------------------------------- providers
+
+
+def _provider_settings(
+    config: Path | None,
+    *,
+    provider: str | None = None,
+    model: str | None = None,
+    fallbacks: list[str] | None = None,
+) -> Settings:
+    overrides: dict[str, Any] = {"agent": {}}
+    if provider:
+        overrides["agent"]["default_provider"] = provider
+    if model:
+        overrides["agent"]["default_model"] = model
+    if fallbacks:
+        overrides["agent"]["fallback_models"] = fallbacks
+    try:
+        return load_settings(config, overrides=overrides)
+    except BearError as exc:
+        _fail(str(exc), code=2)
+    except Exception as exc:
+        _fail(str(exc), code=2)
+    raise AssertionError("unreachable")
+
+
+@providers_app.command("show")
+def providers_show(
+    config: Path | None = typer.Option(None, "--config"),
+    as_json: bool = typer.Option(False, "--json"),
+) -> None:
+    """显示 Primary、Fallback、能力与重试策略 (不输出密钥)."""
+    settings = _provider_settings(config)
+    try:
+        provider = build_fallback_provider(
+            settings,
+            secret_store=secret_store_from_config(settings.secrets.backend),
+        )
+        snapshot = provider.snapshot()
+    except BearError as exc:
+        console.print(f"[yellow]provider router unavailable:[/yellow] {exc}")
+        console.print(
+            f"primary={settings.agent.default_provider}:{settings.agent.default_model} "
+            f"fallbacks={settings.agent.fallback_models}"
+        )
+        return
+    finally:
+        with contextlib.suppress(Exception):
+            if "provider" in locals():
+                asyncio.run(provider.aclose())
+    if as_json:
+        console.print_json(json.dumps(snapshot, ensure_ascii=False))
+        return
+    table = Table(title="Provider routes")
+    table.add_column("#", width=2)
+    table.add_column("provider", style="cyan")
+    table.add_column("model")
+    table.add_column("context")
+    table.add_column("tools")
+    table.add_column("stream")
+    table.add_column("retries")
+    for index, route in enumerate(provider.routes, start=1):
+        table.add_row(
+            str(index),
+            route.name,
+            route.model,
+            str(route.capabilities.context_window),
+            "yes" if route.capabilities.supports_tools else "no",
+            "yes" if route.capabilities.supports_streaming else "no",
+            str(route.retry_policy.max_attempts),
+        )
+    console.print(table)
+    console.print(
+        f"fallback_enabled={settings.agent.provider_fallback_enabled} "
+        f"circuit_failures={settings.agent.circuit_breaker_failures} "
+        f"cooldown={settings.agent.circuit_breaker_cooldown_s:.0f}s"
+    )
+    for error in snapshot.get("configuration_errors") or []:
+        console.print(f"[yellow]config issue:[/yellow] {error}")
+
+
+@providers_app.command("test")
+def providers_test(
+    config: Path | None = typer.Option(None, "--config"),
+    provider_name: str | None = typer.Option(None, "--provider"),
+    model: str | None = typer.Option(None, "--model"),
+    prompt: str = typer.Option("Reply with the single word: pong", "--prompt"),
+) -> None:
+    """发送一个最小请求, 验证 Primary / Fallback 是否可用."""
+    settings = _provider_settings(config, provider=provider_name, model=model)
+    try:
+        settings.validate_ready()
+    except ValueError as exc:
+        _fail(str(exc), code=2)
+
+    async def _call() -> int:
+        router = build_fallback_provider(
+            settings,
+            secret_store=secret_store_from_config(settings.secrets.backend),
+        )
+        caller = ModelCaller(router)
+        try:
+            response = await caller.call(
+                ModelRequest(
+                    model=settings.agent.default_model,
+                    messages=[
+                        SystemMessage.of("You are a health check."),
+                        UserMessage.of(prompt),
+                    ],
+                    tools=[],
+                    temperature=0.0,
+                    max_output_tokens=16,
+                    stream=False,
+                ),
+                CancelToken(),
+            )
+        except Exception as exc:
+            console.print(f"[red]provider test failed:[/red] {type(exc).__name__}: {exc}")
+            for route_status in router.status():
+                console.print(
+                    f"  {route_status['provider']}/{route_status['model']}: "
+                    f"{route_status['state']} failures={route_status['consecutive_failures']}"
+                )
+            return 1
+        finally:
+            await router.aclose()
+        route = router.last_route
+        console.print(
+            f"[green]ok[/green] provider={route[0] if route else '?'} "
+            f"model={route[1] if route else '?'} "
+            f"reply={response.text[:80]!r}"
+        )
+        return 0
+
+    raise typer.Exit(code=asyncio.run(_call()))
+
+
+# --------------------------------------------------------------------- plugins
+
+
+def _plugin_manager(settings: Settings) -> PluginManager:
+    return PluginManager(
+        settings.plugins,
+        data_dir=settings.ensure_data_dirs(),
+        hooks_allow_external=settings.hooks.allow_external,
+        hooks_enabled=settings.hooks.enabled,
+    )
+
+
+@plugins_app.command("list")
+def plugins_list(
+    config: Path | None = typer.Option(None, "--config"),
+    as_json: bool = typer.Option(False, "--json"),
+) -> None:
+    """列出发现的 Plugin 与启用状态。"""
+    settings = _load(
+        config=config,
+        base_url=None,
+        api_key=None,
+        provider=None,
+        model=None,
+        permission=None,
+        max_turns=None,
+    )
+    manager = _plugin_manager(settings)
+    infos = manager.list()
+    if as_json:
+        console.print_json(
+            json.dumps([info.model_dump(mode="json") for info in infos], ensure_ascii=False)
+        )
+        return
+    table = Table(title="Plugins")
+    table.add_column("id", style="cyan", no_wrap=True)
+    table.add_column("version")
+    table.add_column("enabled")
+    table.add_column("status")
+    table.add_column("hooks")
+    table.add_column("mcp")
+    table.add_column("python")
+    for info in infos:
+        table.add_row(
+            info.plugin_id,
+            info.version,
+            "yes" if info.enabled else "no",
+            info.status.value,
+            ",".join(info.hooks),
+            ",".join(info.mcp_servers),
+            "yes" if info.python else "no",
+        )
+    console.print(table)
+    status = manager.status()
+    for error in status.get("discovery_errors") or []:
+        console.print(f"[yellow]discovery:[/yellow] {error}")
+    for error in status.get("conflicts") or []:
+        console.print(f"[yellow]conflict:[/yellow] {error}")
+
+
+@plugins_app.command("validate")
+def plugins_validate(
+    config: Path | None = typer.Option(None, "--config"),
+) -> None:
+    """校验所有 Plugin Manifest、依赖与权限。"""
+    settings = _load(
+        config=config,
+        base_url=None,
+        api_key=None,
+        provider=None,
+        model=None,
+        permission=None,
+        max_turns=None,
+    )
+    manager = _plugin_manager(settings)
+    report = manager.validate_all()
+    for plugin in report.plugins:
+        state = "ok" if plugin.ok else "invalid"
+        console.print(f"[cyan]{plugin.plugin_id}[/cyan] {state} [dim]{plugin.path}[/dim]")
+        for error in plugin.errors:
+            console.print(f"  [red]error:[/red] {error}")
+        for warning in plugin.warnings:
+            console.print(f"  [yellow]warn:[/yellow] {warning}")
+    for error in manager.status().get("discovery_errors") or []:
+        console.print(f"[red]error:[/red] {error}")
+    if not report.ok:
+        raise typer.Exit(code=1)
+
+
+@plugins_app.command("info")
+def plugins_info(
+    plugin_id: str = typer.Argument(...),
+    config: Path | None = typer.Option(None, "--config"),
+) -> None:
+    """查看一个 Plugin 的详情。"""
+    settings = _load(
+        config=config,
+        base_url=None,
+        api_key=None,
+        provider=None,
+        model=None,
+        permission=None,
+        max_turns=None,
+    )
+    info = _plugin_manager(settings).info(plugin_id)
+    if info is None:
+        _fail(f"unknown plugin: {plugin_id}", code=2)
+    console.print_json(json.dumps(info.model_dump(mode="json"), ensure_ascii=False))
+
+
+@plugins_app.command("enable")
+def plugins_enable(
+    plugin_id: str = typer.Argument(...),
+    config: Path | None = typer.Option(None, "--config"),
+) -> None:
+    """启用 Plugin (下次启动生效)."""
+    settings = _load(
+        config=config,
+        base_url=None,
+        api_key=None,
+        provider=None,
+        model=None,
+        permission=None,
+        max_turns=None,
+    )
+    try:
+        _plugin_manager(settings).enable(plugin_id)
+    except Exception as exc:
+        _fail(str(exc), code=1)
+    console.print(f"plugin {plugin_id} enabled")
+
+
+@plugins_app.command("disable")
+def plugins_disable(
+    plugin_id: str = typer.Argument(...),
+    config: Path | None = typer.Option(None, "--config"),
+) -> None:
+    """禁用 Plugin。"""
+    settings = _load(
+        config=config,
+        base_url=None,
+        api_key=None,
+        provider=None,
+        model=None,
+        permission=None,
+        max_turns=None,
+    )
+    manager = _plugin_manager(settings)
+
+    async def _disable() -> None:
+        await manager.disable(plugin_id)
+
+    try:
+        asyncio.run(_disable())
+    except Exception as exc:
+        _fail(str(exc), code=1)
+    console.print(f"plugin {plugin_id} disabled")
+
+
+# ------------------------------------------------------------------------- mcp
+
+
+def _mcp_manager(settings: Settings) -> tuple[MCPManager, ToolRegistry]:
+    registry = ToolRegistry()
+    manager = MCPManager(
+        settings.mcp,
+        registry,
+        workspace=Path.cwd(),
+        server_cwd=settings.ensure_data_dirs() / "mcp",
+        redactor=SecretRedactor(),
+        secret_store=secret_store_from_config(settings.secrets.backend),
+    )
+    return manager, registry
+
+
+@mcp_app.command("status")
+def mcp_status(
+    config: Path | None = typer.Option(None, "--config"),
+) -> None:
+    """连接已配置的 MCP Server 并显示状态。"""
+    settings = _load(
+        config=config,
+        base_url=None,
+        api_key=None,
+        provider=None,
+        model=None,
+        permission=None,
+        max_turns=None,
+    )
+    manager, _registry = _mcp_manager(settings)
+
+    async def _status() -> int:
+        try:
+            statuses = await manager.start()
+        except Exception as exc:
+            console.print(f"[red]mcp startup failed:[/red] {exc}")
+            return 1
+        finally:
+            with contextlib.suppress(Exception):
+                await manager.stop()
+        table = Table(title="MCP servers")
+        table.add_column("server", style="cyan")
+        table.add_column("transport")
+        table.add_column("state")
+        table.add_column("required")
+        table.add_column("tools")
+        table.add_column("last error")
+        for status in statuses.values():
+            table.add_row(
+                status.name,
+                status.transport,
+                status.state,
+                "yes" if status.required else "no",
+                str(len(status.tools)),
+                status.last_error or "",
+            )
+        console.print(table)
+        return 0
+
+    raise typer.Exit(code=asyncio.run(_status()))
+
+
+@mcp_app.command("tools")
+def mcp_tools(
+    config: Path | None = typer.Option(None, "--config"),
+) -> None:
+    """列出 MCP 发现并注册的工具。"""
+    settings = _load(
+        config=config,
+        base_url=None,
+        api_key=None,
+        provider=None,
+        model=None,
+        permission=None,
+        max_turns=None,
+    )
+    manager, registry = _mcp_manager(settings)
+
+    async def _tools() -> int:
+        rows: list[tuple[str, str]] = []
+        try:
+            await manager.start()
+            for name in registry.names():
+                tool = registry.get(name)
+                if tool is not None:
+                    rows.append((name, tool.description))
+        except Exception as exc:
+            console.print(f"[red]mcp startup failed:[/red] {exc}")
+            return 1
+        finally:
+            with contextlib.suppress(Exception):
+                await manager.stop()
+        for name, description in rows:
+            console.print(f"[cyan]{name}[/cyan] {description}")
+        return 0
+
+    raise typer.Exit(code=asyncio.run(_tools()))
+
+
+# ----------------------------------------------------------------------- hooks
+
+
+@hooks_app.command("list")
+def hooks_list(
+    config: Path | None = typer.Option(None, "--config"),
+    as_json: bool = typer.Option(False, "--json"),
+) -> None:
+    """列出已配置与已注册的 Hook。"""
+    settings = _load(
+        config=config,
+        base_url=None,
+        api_key=None,
+        provider=None,
+        model=None,
+        permission=None,
+        max_turns=None,
+    )
+    manager = HookManager(
+        config=settings.hooks,
+        workspace=Path.cwd(),
+        safe_cwd=settings.ensure_data_dirs() / "hooks",
+    )
+    rows = manager.list()
+    if as_json:
+        console.print_json(json.dumps(rows, ensure_ascii=False))
+        return
+    table = Table(title="Hooks")
+    table.add_column("id", style="cyan")
+    table.add_column("events")
+    table.add_column("source")
+    table.add_column("fail")
+    table.add_column("deny")
+    table.add_column("context")
+    for row in rows:
+        table.add_row(
+            str(row.get("id")),
+            ",".join(row.get("events") or []),
+            str(row.get("source")),
+            str(row.get("fail_mode")),
+            "yes" if row.get("can_deny") else "no",
+            "yes" if row.get("can_append_context") else "no",
+        )
+    console.print(table)
 
 
 # ----------------------------------------------------------------------- admin
@@ -1626,6 +2116,58 @@ def doctor(
         )
     except Exception as exc:
         checks.append(("provider", "fail", str(exc)))
+    try:
+        router = build_fallback_provider(settings, secret_store=secret_store)
+        try:
+            checks.append(
+                (
+                    "fallback",
+                    "ok" if not router.configuration_errors else "warn",
+                    f"{len(router.routes)} route(s)"
+                    + (
+                        f", {len(router.configuration_errors)} skipped"
+                        if router.configuration_errors
+                        else ""
+                    ),
+                )
+            )
+        finally:
+            asyncio.run(router.aclose())
+    except Exception as exc:
+        checks.append(("fallback", "warn", str(exc)))
+    checks.append(
+        (
+            "hooks",
+            "ok" if settings.hooks.enabled else "warn",
+            f"{len(settings.hooks.commands)} command hook(s), "
+            f"external={'on' if settings.hooks.allow_external else 'off'}",
+        )
+    )
+    checks.append(
+        (
+            "mcp",
+            "ok" if settings.mcp.enabled else "warn",
+            f"{len(settings.mcp.servers)} server(s); run `bear mcp status` to connect",
+        )
+    )
+    try:
+        plugin_manager = PluginManager(
+            settings.plugins,
+            data_dir=settings.ensure_data_dirs(),
+            hooks_allow_external=settings.hooks.allow_external,
+            hooks_enabled=settings.hooks.enabled,
+        )
+        plugin_report = plugin_manager.validate_all()
+        checks.append(
+            (
+                "plugins",
+                "ok" if plugin_report.ok else "fail",
+                f"{len(plugin_report.plugins)} discovered; "
+                f"{sum(1 for item in plugin_report.plugins if item.ok)} valid",
+            )
+        )
+    except Exception as exc:
+        checks.append(("plugins", "warn", str(exc)))
 
     if secret_store.available():
         checks.append(("secrets", "ok", f"{settings.secrets.backend} backend available"))

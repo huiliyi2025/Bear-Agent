@@ -1,6 +1,6 @@
 # 架构
 
-> 状态：阶段 4（Task / Plan / Todo Engine）。本文描述当前已经实现的能力，以及后续阶段必须遵守的边界。
+> 状态：阶段 5（Hooks / MCP / Plugins / Provider Fallback）。本文描述当前已经实现的能力，以及后续阶段必须遵守的边界。
 
 ## 目标
 
@@ -11,7 +11,7 @@ Bear-Agent 是本地优先的 Agent Harness，具备四项不可妥协的属性�
 3. **执行层安全**——权限与路径边界由代码强制执行，而不是依赖 Prompt 请求模型遵守。
 4. **可替换的边缘**——模型、存储、工具与 UI 都是端口/适配器。
 
-阶段 4 的非目标：托管多租户服务、分布式 Worker、图形化工作流编排器、模型训练。
+阶段 5 的非目标：托管多租户服务、分布式 Worker、图形化工作流编排器、模型训练。
 
 ## 分层
 
@@ -113,6 +113,10 @@ CLI / run 命令
 | `storage` | SQLite Schema、事务、Repository | 业务决策 |
 | `sessions` | 会话记录、转录、租约、Checkpoint、恢复、Fork | 模型调用 |
 | `tasks` | Plan/Task/Todo 模型、状态机、依赖调度、规划、验证、执行决策 | Tool/权限执行 |
+| `hooks` | Hook 生命周期、注册/匹配/超时/策略、外部命令 Hook | 绕过权限或修改工具参数 |
+| `mcp` | MCP Client/Manager、Tool 适配、Schema 校验、连接生命周期 | 自行实现协议栈 |
+| `plugins` | Manifest、依赖/权限校验、状态、MCP/Hook/Tool 贡献 | 绕过 ToolExecutor |
+| `providers/router` | 多 Provider/Model 路由、重试、Fallback、Circuit | Provider wire 协议 |
 | `shell/process_registry` | 记录与终止运行中的 Shell 进程 | 命令策略 |
 | `providers` | Provider 端口、OpenAI 兼容适配器、重试分类 | 工具执行 |
 | `tools` | 工具契约、注册表、参数校验、执行器、内置工具 | 权限策略 |
@@ -225,6 +229,18 @@ Plan 是 Session 当前的结构化目标；Task 是带依赖、验收标准和�
 调度由程序完成：`claim_next` 在事务内选择依赖已完成、pending、active 的最高优先级 Task，转为 in_progress 并创建 attempt；同一 Session 同时只有一个 in_progress Task。运行结果由 `TaskEngine` 结合 `task_complete` 请求、evidence 或独立模型验证决定 completed/failed/blocked，模型不能直接写状态。
 
 `AgentRuntime.run_plan` 在一次持续 Lease 下循环：领取 Task → 用现有 turn/tool 路径执行 → 验证 → 更新状态 → 下一个 Task。每轮固定注入 Plan/Todo/当前 Task，压缩不会移除。执行过非幂等工具的失败 Task 不会自动重试；崩溃中的 running attempt 由 Recovery 标记 unknown、Task 标记 blocked。
+
+## 扩展：Hooks / MCP / Plugins
+
+Hooks 以 EventBus 观察事实事件（task/checkpoint/recovery/context/run 等），并在 `model_before`/`tool_before` 提供同步拦截。`tool_before` 在审批与 Claim 之后、工具副作用之前运行，只能额外拒绝；`model_before` 只能追加有界、脱敏的 pinned 上下文。外部命令 Hook 默认关闭，以无 shell 子进程 + JSON 协议运行。
+
+MCP 使用官方 SDK，以 stdio 或 Streamable HTTP 连接。工具注册为 `mcp__<server>__<tool>`，使用原始 JSON Schema；调用经过 ToolExecutor 的权限/审批/审计链。Server 必须显式 trusted；断开时当前调用失败，不自动重试副作用；重连会替换旧工具。
+
+Plugin 是 Manifest 扩展包，可贡献 MCP Server、外部 Hook 和（显式允许的）进程内 Python Hook/Tool。Python 默认关闭，进程内无沙箱；Manifest-only 扩展不需要加载代码。Container 启动时加载 Plugin、合并 MCP 配置、连接 Server 并注册工具。
+
+## Provider 路由
+
+`FallbackProvider` 维护有序 Primary/Fallback 路由、每路由 RetryPolicy、能力与 Circuit Breaker。只有尚未产生任何流事件时才允许重试/切换；一旦输出文本、Thinking、Tool Call、Usage 或 Finish，失败以 `partial_stream` 结束，避免重复文本/工具副作用。实际 route 写入 ModelResponse/model_calls，并通过 `provider.*` 事件观察。
 
 ## Session Fork
 

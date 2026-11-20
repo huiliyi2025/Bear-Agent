@@ -113,6 +113,45 @@ planner_max_retries = 2
 planner_max_output_tokens = 4096
 context_max_tokens = 1200    # 每轮固定注入的 Task/Plan 上下文上限
 
+[hooks]
+enabled = true
+timeout_s = 5
+max_depth = 8
+max_context_chars = 4000
+# External hook commands run with the user's OS privileges. Keep disabled
+# unless you trust every configured command.
+allow_external = false
+
+# [[hooks.commands]]
+# id = "audit-tool"
+# event = "before_tool_call"
+# command = "python"
+# args = ["path/to/hook.py"]
+# timeout_s = 5
+# fail_mode = "closed"
+
+[mcp]
+enabled = true
+# Servers are opt-in. Example:
+# [mcp.servers.local_docs]
+# transport = "stdio"
+# command = "python"
+# args = ["-m", "my_mcp_server"]
+# trusted = true
+# required = true
+# timeout_s = 60
+#
+# [mcp.servers.remote_docs]
+# transport = "streamable_http"
+# url = "https://example.com/mcp"
+# trusted = true
+# verify_tls = true
+
+[plugins]
+enabled = true
+allow_python = false
+# dirs = ["~/.local/share/bear-agent/plugins"]
+
 # Any OpenAI-compatible endpoint works, including Ollama / vLLM / a relay:
 # [providers.local]
 # type = "openai_compat"
@@ -214,6 +253,10 @@ def _apply_env_overrides(raw: dict[str, Any]) -> None:
 
     if _env("BEAR_SYSTEM_PROMPT_EXTRA"):
         agent["system_prompt_extra"] = _env("BEAR_SYSTEM_PROMPT_EXTRA")
+    if _env("BEAR_FALLBACK_MODELS"):
+        agent["fallback_models"] = [
+            item.strip() for item in (_env("BEAR_FALLBACK_MODELS") or "").split(",") if item.strip()
+        ]
 
 
 def _coerce(value: str) -> Any:
@@ -267,6 +310,10 @@ def settings_to_toml(settings: Settings) -> str:
         "permission_mode",
         "stream",
         "max_run_seconds",
+        "fallback_models",
+        "provider_fallback_enabled",
+        "circuit_breaker_failures",
+        "circuit_breaker_cooldown_s",
     ):
         value = getattr(agent, key)
         lines.append(f"{key} = {_toml_value(value)}")
@@ -311,6 +358,19 @@ def settings_to_toml(settings: Settings) -> str:
     lines.extend(["", "[tasks]"])
     for key, value in settings.tasks.model_dump().items():
         lines.append(f"{key} = {_toml_value(value)}")
+    lines.extend(["", "[hooks]"])
+    hooks = settings.hooks
+    for key in ("enabled", "timeout_s", "max_depth", "max_context_chars", "allow_external"):
+        lines.append(f"{key} = {_toml_value(getattr(hooks, key))}")
+    lines.append(f"commands = {len(hooks.commands)}")
+    lines.extend(["", "[mcp]"])
+    lines.append(f"enabled = {_toml_value(settings.mcp.enabled)}")
+    lines.append(f"servers = {_toml_value(sorted(settings.mcp.servers))}")
+    lines.extend(["", "[plugins]"])
+    plugins = settings.plugins
+    for key in ("enabled", "allow_python", "max_plugins"):
+        lines.append(f"{key} = {_toml_value(getattr(plugins, key))}")
+    lines.append(f"dirs = {_toml_value([str(path) for path in plugins.dirs])}")
     for name, provider in settings.providers.items():
         lines.append("")
         lines.append(f"[providers.{name}]")

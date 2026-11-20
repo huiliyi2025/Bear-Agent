@@ -134,3 +134,35 @@ class ProviderError(BearError):
 
     def __str__(self) -> str:
         return self.message
+
+
+class HookError(BearError):
+    pass
+
+
+class HookTimeout(HookError):
+    pass
+
+
+class MCPError(BearError):
+    pass
+
+
+class MCPUnavailable(MCPError):
+    pass
+
+
+class MCPToolError(MCPError):
+    pass
+
+
+class PluginError(BearError):
+    pass
+
+
+class PluginManifestError(PluginError):
+    pass
+
+
+class PluginLoadError(PluginError):
+    pass

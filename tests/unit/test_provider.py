@@ -189,6 +189,67 @@ async def test_no_retry_after_partial_output() -> None:
     assert inner.calls == 1
 
 
+@respx.mock
+@pytest.mark.asyncio
+async def test_sse_error_payload_is_a_provider_error() -> None:
+    respx.post("http://fake.local/v1/chat/completions").mock(
+        return_value=httpx.Response(
+            200,
+            text='data: {"error":{"message":"quota exceeded","code":"insufficient_quota"}}\n\n',
+            headers={"content-type": "text/event-stream"},
+        )
+    )
+    with pytest.raises(ProviderError) as caught:
+        [event async for event in _provider().stream(_request(), CancelToken())]
+    assert caught.value.category == "rate_limit"
+    assert caught.value.retryable is True
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_truncated_sse_without_finish_is_malformed() -> None:
+    respx.post("http://fake.local/v1/chat/completions").mock(
+        return_value=httpx.Response(
+            200,
+            text='data: {"choices":[{"delta":{"content":"half an answer"}}]}\n\n',
+            headers={"content-type": "text/event-stream"},
+        )
+    )
+    with pytest.raises(ProviderError) as caught:
+        [event async for event in _provider().stream(_request(), CancelToken())]
+    assert caught.value.category == "malformed_response"
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_http_400_context_length_is_classified() -> None:
+    respx.post("http://fake.local/v1/chat/completions").mock(
+        return_value=httpx.Response(
+            400,
+            json={
+                "error": {
+                    "message": "This model's maximum context length is 8192 tokens",
+                    "code": "context_length_exceeded",
+                }
+            },
+        )
+    )
+    with pytest.raises(ProviderError) as caught:
+        [event async for event in _provider().stream(_request(), CancelToken())]
+    assert caught.value.category == "context_length"
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_http_402_is_fallbackable_auth_error() -> None:
+    respx.post("http://fake.local/v1/chat/completions").mock(
+        return_value=httpx.Response(402, json={"error": {"message": "insufficient balance"}})
+    )
+    with pytest.raises(ProviderError) as caught:
+        [event async for event in _provider().stream(_request(), CancelToken())]
+    assert caught.value.category == "auth"
+
+
 def test_message_conversion() -> None:
     message = AssistantMessage.with_tool_calls(
         "hi", [ToolCall(id="c1", name="read_file", arguments={"path": "a"})]

@@ -7,6 +7,7 @@ before any tool side effect begins.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 from dataclasses import dataclass
@@ -14,11 +15,14 @@ from dataclasses import dataclass
 from bear_agent.context.builder import ContextBuilder
 from bear_agent.context.compaction import ContextCompactor
 from bear_agent.core.cancel import CancelToken
+from bear_agent.core.errors import HookError, ProviderError
 from bear_agent.core.events import EventType
 from bear_agent.core.fencing import LeaseFence
 from bear_agent.core.ids import new_id
 from bear_agent.core.messages import AssistantMessage, ToolMessage
 from bear_agent.core.usage import TokenUsage
+from bear_agent.hooks.events import HookEvent
+from bear_agent.hooks.manager import HookManager
 from bear_agent.observability.recorder import EventRecorder
 from bear_agent.providers.base import ModelRequest
 from bear_agent.runtime.model_caller import ModelCaller, ModelResponse
@@ -51,6 +55,7 @@ class TurnExecutor:
         recorder: EventRecorder,
         compactor: ContextCompactor | None = None,
         tasks: TaskService | None = None,
+        hooks: HookManager | None = None,
         model: str,
         provider_name: str = "",
         temperature: float = 0.0,
@@ -65,6 +70,7 @@ class TurnExecutor:
         self.recorder = recorder
         self.compactor = compactor
         self.tasks = tasks
+        self.hooks = hooks
         self.model = model
         self.provider_name = provider_name
         self.temperature = temperature
@@ -120,6 +126,24 @@ class TurnExecutor:
                 system_extra = "\n\n".join(
                     part for part in (system_extra, task_block) if part.strip()
                 )
+        if self.hooks is not None:
+            hook_outcome = await self.hooks.before_model_call(
+                model=self.model or (session.model or ""),
+                messages=len(messages_for_context),
+                tools=len(tools),
+                session_id=session.id,
+                run_id=run_id,
+                turn_id=turn_id,
+                fence=(LeaseFence(lease_owner, lease_epoch) if lease_epoch is not None else None),
+            )
+            if hook_outcome.failed_closed:
+                raise HookError(
+                    "a fail-closed model hook failed: " + (hook_outcome.reason or "hook failure")
+                )
+            if hook_outcome.context_append:
+                system_extra = "\n\n".join(
+                    part for part in (system_extra, hook_outcome.context_append) if part.strip()
+                )
         built = self.context_builder.build(messages_for_context, tools, system_extra=system_extra)
         await self.recorder.record(
             session.id,
@@ -157,6 +181,11 @@ class TurnExecutor:
             temperature=self.temperature,
             max_output_tokens=self.max_output_tokens,
             stream=self.stream,
+            metadata={
+                "session_id": session.id,
+                "run_id": run_id,
+                "turn_id": turn_id,
+            },
         )
         await self.recorder.record(
             session.id,
@@ -192,12 +221,40 @@ class TurnExecutor:
                 payload={"text": delta},
             )
 
-        response = await self.model_caller.call(
-            request,
-            cancel,
-            on_text_delta=on_text,
-            on_thinking_delta=on_thinking,
-        )
+        try:
+            response = await self.model_caller.call(
+                request,
+                cancel,
+                on_text_delta=on_text,
+                on_thinking_delta=on_thinking,
+            )
+        except ProviderError as exc:
+            with contextlib.suppress(Exception):
+                await self.sessions.model_calls.record(
+                    call_id=new_id("mc"),
+                    session_id=session.id,
+                    turn_id=turn_id,
+                    provider=self.provider_name,
+                    model=request.model,
+                    usage=TokenUsage(),
+                    latency_ms=0,
+                    status="failed",
+                )
+            if self.hooks is not None:
+                with contextlib.suppress(Exception):
+                    await self.hooks.emit(
+                        HookEvent.MODEL_ERROR,
+                        session_id=session.id,
+                        run_id=run_id,
+                        turn_id=turn_id,
+                        payload={"model": request.model, "category": exc.category},
+                        fence=(
+                            LeaseFence(lease_owner, lease_epoch)
+                            if lease_epoch is not None
+                            else None
+                        ),
+                    )
+            raise
         _, message_event = await self.sessions.append_assistant_message(
             session.id,
             response.message,
@@ -216,8 +273,8 @@ class TurnExecutor:
             call_id=new_id("mc"),
             session_id=session.id,
             turn_id=turn_id,
-            provider=self.provider_name or (session.provider or ""),
-            model=request.model,
+            provider=response.provider_name or self.provider_name or (session.provider or ""),
+            model=response.model or request.model,
             usage=usage,
             latency_ms=response.latency_ms,
             status="completed",
@@ -232,6 +289,8 @@ class TurnExecutor:
                 "latency_ms": response.latency_ms,
                 "usage": usage.model_dump(),
                 "has_tool_calls": bool(response.message.tool_calls()),
+                "provider": response.provider_name or self.provider_name,
+                "model": response.model or request.model,
             },
         )
 

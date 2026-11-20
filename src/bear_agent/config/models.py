@@ -14,11 +14,13 @@ the resolved key is never logged.
 
 from __future__ import annotations
 
+import ipaddress
 import os
 from pathlib import Path
 from typing import Literal
+from urllib.parse import urlsplit
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from bear_agent.core.modes import PermissionMode
 
@@ -31,15 +33,37 @@ class ProviderConfig(BaseModel):
     models: list[str] = Field(default_factory=list)
     timeout_s: float = 120.0
     max_retries: int = 2
+    retry_base_delay_s: float = 0.5
+    retry_max_delay_s: float = 8.0
+    retry_jitter: float = 0.2
     # Ask OpenAI-compatible endpoints to include usage on the final stream chunk.
     # Disabled by default because some relays reject unknown stream_options.
     include_usage: bool = False
     headers: dict[str, str] = Field(default_factory=dict)
+    # Per-provider capability hints used by provider fallback. None means use
+    # the global agent settings.
+    context_window: int | None = None
+    supports_tools: bool = True
+    supports_streaming: bool = True
 
     @field_validator("base_url")
     @classmethod
     def _strip_base_url(cls, value: str) -> str:
         return value.rstrip("/")
+
+    @field_validator("retry_base_delay_s", "retry_max_delay_s", "retry_jitter")
+    @classmethod
+    def _retry_values(cls, value: float) -> float:
+        if value < 0:
+            raise ValueError("retry delays/jitter must not be negative")
+        return value
+
+    @field_validator("retry_jitter")
+    @classmethod
+    def _jitter_bounds(cls, value: float) -> float:
+        if value > 1:
+            raise ValueError("retry_jitter must be between 0 and 1")
+        return value
 
     def resolve_api_key(self, secret_store: object | None = None) -> str:
         if self.api_key:
@@ -77,6 +101,11 @@ class AgentConfig(BaseModel):
     system_prompt_extra: str = ""
     # Hard wall-clock limit for one run; 0 disables the limit.
     max_run_seconds: float = 0.0
+    # Fallback model targets in "provider:model" or "provider" form.
+    fallback_models: list[str] = Field(default_factory=list)
+    provider_fallback_enabled: bool = True
+    circuit_breaker_failures: int = 3
+    circuit_breaker_cooldown_s: float = 60.0
 
     @field_validator("max_turns", "max_tool_calls")
     @classmethod
@@ -287,6 +316,109 @@ class TasksConfig(BaseModel):
         return value
 
 
+class HookCommandConfig(BaseModel):
+    id: str = Field(min_length=1, max_length=100)
+    event: str = Field(min_length=1, max_length=100)
+    command: str = Field(min_length=1)
+    args: list[str] = Field(default_factory=list)
+    timeout_s: float = 5.0
+    fail_mode: Literal["open", "closed"] = "open"
+    enabled: bool = True
+
+    @field_validator("timeout_s")
+    @classmethod
+    def _positive_timeout(cls, value: float) -> float:
+        if value <= 0:
+            raise ValueError("must be positive")
+        return value
+
+
+class HooksConfig(BaseModel):
+    enabled: bool = True
+    timeout_s: float = 5.0
+    max_depth: int = 8
+    max_context_chars: int = 4_000
+    # External hook commands run as OS subprocesses with the user's privileges;
+    # they are opt-in and never loaded from model output.
+    allow_external: bool = False
+    commands: list[HookCommandConfig] = Field(default_factory=list)
+
+
+class MCPServerConfig(BaseModel):
+    transport: Literal["stdio", "streamable_http"] = "stdio"
+    command: str = ""
+    args: list[str] = Field(default_factory=list)
+    env: dict[str, str] = Field(default_factory=dict)
+    cwd: str | None = None
+    url: str = ""
+    headers: dict[str, str] = Field(default_factory=dict)
+    enabled: bool = True
+    # Explicit trust decision required for every enabled server.
+    trusted: bool = False
+    required: bool = True
+    timeout_s: float = 60.0
+    startup_timeout_s: float = 20.0
+    allowed_tools: list[str] = Field(default_factory=list)
+    denied_tools: list[str] = Field(default_factory=list)
+    verify_tls: bool = True
+    allow_insecure_http: bool = False
+
+
+class MCPConfig(BaseModel):
+    enabled: bool = True
+    servers: dict[str, MCPServerConfig] = Field(default_factory=dict)
+
+    @field_validator("servers")
+    @classmethod
+    def _validate_servers(cls, value: dict[str, MCPServerConfig]) -> dict[str, MCPServerConfig]:
+        if len(value) > 50:
+            raise ValueError("too many MCP servers (max 50)")
+        for name, server in value.items():
+            if (
+                not name
+                or len(name) > 64
+                or not all(char.isalnum() or char in "_-" for char in name)
+            ):
+                raise ValueError(f"invalid MCP server name: {name!r}")
+            if server.enabled and not server.trusted:
+                raise ValueError(
+                    f"MCP server {name!r} is enabled but not trusted; set trusted=true "
+                    "only for servers you actually trust"
+                )
+            if server.transport == "stdio" and not server.command:
+                raise ValueError(f"MCP server {name!r} requires a command")
+            if server.transport == "streamable_http":
+                if not server.url:
+                    raise ValueError(f"MCP server {name!r} requires a url")
+                try:
+                    parts = urlsplit(server.url)
+                    host = (parts.hostname or "").lower()
+                    _ = parts.port
+                except ValueError as exc:
+                    raise ValueError(f"MCP server {name!r} has an invalid url") from exc
+                try:
+                    loopback = ipaddress.ip_address(host).is_loopback
+                except ValueError:
+                    loopback = host == "localhost"
+                if parts.scheme != "https" and not (parts.scheme == "http" and loopback):
+                    raise ValueError(
+                        f"MCP server {name!r} must use https (http is allowed only "
+                        "for loopback development servers)"
+                    )
+                if parts.username is not None or parts.password is not None:
+                    raise ValueError(f"MCP server {name!r} url must not embed credentials")
+        return value
+
+
+class PluginsConfig(BaseModel):
+    enabled: bool = True
+    dirs: list[Path] = Field(default_factory=list)
+    # Loading arbitrary in-process Python is disabled by default. Manifest-only
+    # plugins (MCP servers / external hooks) do not need this.
+    allow_python: bool = False
+    max_plugins: int = 50
+
+
 class Settings(BaseModel):
     providers: dict[str, ProviderConfig] = Field(
         default_factory=lambda: {"default": ProviderConfig()}
@@ -303,6 +435,9 @@ class Settings(BaseModel):
     checkpoints: CheckpointConfig = Field(default_factory=CheckpointConfig)
     recovery: RecoveryConfig = Field(default_factory=RecoveryConfig)
     tasks: TasksConfig = Field(default_factory=TasksConfig)
+    hooks: HooksConfig = Field(default_factory=HooksConfig)
+    mcp: MCPConfig = Field(default_factory=MCPConfig)
+    plugins: PluginsConfig = Field(default_factory=PluginsConfig)
 
     def provider(self, name: str | None = None) -> ProviderConfig:
         provider_name = name or self.agent.default_provider
@@ -314,6 +449,20 @@ class Settings(BaseModel):
 
     def provider_names(self) -> list[str]:
         return sorted(self.providers)
+
+    @model_validator(mode="after")
+    def _validate_fallback_models(self) -> Settings:
+        for spec in self.agent.fallback_models:
+            provider_name, separator, model = spec.partition(":")
+            if not provider_name or (separator and not model):
+                raise ValueError(
+                    f"invalid fallback model {spec!r}; use 'provider:model' or 'provider'"
+                )
+            if provider_name not in self.providers:
+                raise ValueError(
+                    f"fallback model {spec!r} references unknown provider {provider_name!r}"
+                )
+        return self
 
     def resolved_data_dir(self) -> Path:
         return self.storage.data_dir or default_data_dir()
