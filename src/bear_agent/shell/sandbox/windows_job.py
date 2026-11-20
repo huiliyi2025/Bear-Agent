@@ -84,6 +84,10 @@ class WindowsJobObjectSandbox(Sandbox):
             return False
 
     def wrap(self, argv: list[str], policy: SandboxPolicy, cwd: Path) -> SandboxedCommand:
+        if sys.platform != "win32":
+            # This also keeps the Windows-only ctypes API out of non-Windows
+            # type checking; mypy prunes branches excluded by ``sys.platform``.
+            raise SandboxUnavailable("Windows Job Objects are not available")
         if not self.available():
             raise SandboxUnavailable("Windows Job Objects are not available")
         kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)

@@ -235,25 +235,26 @@ class ShellRunner:
         env: dict[str, str],
         suspend: bool = False,
     ) -> asyncio.subprocess.Process:
-        kwargs: dict[str, object] = {
-            "cwd": str(cwd),
-            "env": env,
-            "stdin": asyncio.subprocess.DEVNULL,
-            "stdout": asyncio.subprocess.PIPE,
-            "stderr": asyncio.subprocess.PIPE,
-        }
         if sys.platform == "win32":
             creationflags = CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW
             if suspend:
                 creationflags |= CREATE_SUSPENDED
-            kwargs["creationflags"] = creationflags
             return await asyncio.create_subprocess_exec(
                 *argv,
-                **kwargs,  # type: ignore[arg-type]
+                cwd=str(cwd),
+                env=env,
+                stdin=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                creationflags=creationflags,
             )
         return await asyncio.create_subprocess_exec(
             *argv,
-            **kwargs,
+            cwd=str(cwd),
+            env=env,
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
             start_new_session=True,
         )
 

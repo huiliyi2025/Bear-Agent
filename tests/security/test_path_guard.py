@@ -39,7 +39,9 @@ def test_symlink_escape(tmp_path: Path) -> None:
     workspace.mkdir()
     outside_dir = tmp_path / "outside"
     outside_dir.mkdir()
-    (outside_dir / "secret.txt").write_text("secret", encoding="utf-8")
+    # Deliberately innocuous: a name like ``secret.txt`` would be rejected by
+    # the sensitive-file rule before the containment check under test.
+    (outside_dir / "payload.txt").write_text("secret", encoding="utf-8")
     link = workspace / "link"
     try:
         link.symlink_to(outside_dir, target_is_directory=True)
@@ -47,14 +49,14 @@ def test_symlink_escape(tmp_path: Path) -> None:
         pytest.skip("symlinks are not available on this host")
     guard = PathGuard(workspace)
     with pytest.raises(PathAccessError, match="outside workspace"):
-        guard.resolve("link/secret.txt")
+        guard.resolve("link/payload.txt")
 
 
 def test_sensitive_files(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     guard = PathGuard(workspace)
-    for name in (".env", ".env.local", "credentials.json", "id_rsa", "server.pem"):
+    for name in (".env", ".env.local", "credentials.json", "id_rsa", "server.pem", "secret.txt"):
         path = workspace / name
         path.write_text("secret", encoding="utf-8")
         with pytest.raises(PathAccessError, match="sensitive file"):
