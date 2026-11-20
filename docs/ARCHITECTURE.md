@@ -1,6 +1,6 @@
 # 架构
 
-> 状态：阶段 2（Shell 执行与安全）。本文描述当前已经实现的能力，以及后续阶段必须遵守的边界。
+> 状态：阶段 3（上下文压缩、Checkpoint、恢复与 Fork）。本文描述当前已经实现的能力，以及后续阶段必须遵守的边界。
 
 ## 目标
 
@@ -11,7 +11,7 @@ Bear-Agent 是本地优先的 Agent Harness，具备四项不可妥协的属性�
 3. **执行层安全**——权限与路径边界由代码强制执行，而不是依赖 Prompt 请求模型遵守。
 4. **可替换的边缘**——模型、存储、工具与 UI 都是端口/适配器。
 
-阶段 2 的非目标：托管多租户服务、分布式 Worker、图形化工作流编排器、模型训练。
+阶段 3 的非目标：托管多租户服务、分布式 Worker、图形化工作流编排器、模型训练。
 
 ## 分层
 
@@ -44,6 +44,10 @@ Bear-Agent 是本地优先的 Agent Harness，具备四项不可妥协的属性�
 - `shell` 负责命令分析、进程执行与 Sandbox 适配器；Runtime 只看到 `ToolResult` 与 Sandbox 元数据。
 - `secrets` 与 `audit` 是共享安全服务，注入 Executor 与需要审计的组件。
 - `sessions/claims.py` 负责文件/树 Claim 协调，不属于模型可见的 Tool API。
+- `context/compaction.py` 只读 Transcript，写入 `compactions` 与 artifact；`ContextBuilder` 是唯一把压缩视图变成 Provider 请求的组件。
+- `sessions/checkpoints.py`、`sessions/recovery.py`、`sessions/fork.py` 通过 Repository 与 SessionService 工作，不 import Runtime。
+- `artifacts/store.py` 只做内容寻址文件 I/O；元数据在 SQLite。
+- `core/fencing.py` 的 ambient `LeaseFence` 由 Runtime 设置，Repository 在同一事务内校验。
 
 ## Runtime 执行流程
 
@@ -53,13 +57,17 @@ CLI / run 命令
   -> AgentRuntime.run(session_id, input)
        获取进程内锁
        获取 SQLite 会话租约（owner + epoch + expiry）
+       设置 context-local LeaseFence
        启动租约心跳
+       如存在崩溃中间态：RecoveryService.recover_if_needed
+         （校验审计链、校验 Checkpoint、合成 unknown 工具结果、清理旧 Claim/进程）
        追加 user message + message.user 事件（同一事务）
        循环：
          检查取消 / 墙钟 / 轮次预算
          TurnExecutor.execute:
            加载转录历史
-           ContextBuilder.build（system + 项目指令 + 历史 + 预算）
+           ContextCompactor.prepare（L1-L4、Anchor Ledger；只读 Transcript）
+           ContextBuilder.build（system + anchors + 压缩视图 + 预算）
            ModelCaller.stream（Provider 事件 -> assistant message + usage）
            持久化 assistant message + model.response 事件
            如果有工具调用：
@@ -74,13 +82,15 @@ CLI / run 命令
                带超时执行（Sandbox 包装后的 Shell / 文件工具）
                脱敏结果，持久化完成状态 + 审计
              持久化工具结果消息
+         每 N 个 turn 创建 Checkpoint
          StopPolicy.evaluate
        finally:
          释放 Claim
-         将中断的 running 工具标记为 unknown
+         将中断的 running 工具标记为 unknown（fenced）
+         会话置为 idle（fenced）
+         持久化 run.completed / run.cancelled / run.failed（fenced）
          释放租约
-         会话置为 idle
-         持久化 run.completed / run.cancelled / run.failed
+         清除 LeaseFence
 ```
 
 关键不变量：
@@ -98,12 +108,14 @@ CLI / run 命令
 | `core` | 消息分段、事件、取消、错误、用量、模式 | I/O |
 | `config` | TOML + 环境变量 + CLI 覆盖合并 | 启动 Agent |
 | `storage` | SQLite Schema、事务、Repository | 业务决策 |
-| `sessions` | 会话记录、转录、租约 | 模型调用 |
+| `sessions` | 会话记录、转录、租约、Checkpoint、恢复、Fork | 模型调用 |
+| `shell/process_registry` | 记录与终止运行中的 Shell 进程 | 命令策略 |
 | `providers` | Provider 端口、OpenAI 兼容适配器、重试分类 | 工具执行 |
 | `tools` | 工具契约、注册表、参数校验、执行器、内置工具 | 权限策略 |
 | `policy` | 权限矩阵、路径边界、敏感文件、审批 | 执行工具 |
-| `context` | 稳定 System Prompt、Token 预算、历史分组 | 持久化状态 |
-| `runtime` | Run/Turn 编排、模型结果聚合、停止规则 | Provider 私有 wire 逻辑 |
+| `context` | 稳定 System Prompt、Token 预算、历史分组、分层压缩、Anchor Ledger | 修改/删除 Transcript |
+| `artifacts` | 内容寻址 artifact 写入、读取校验 | 压缩策略 |
+| `runtime` | Run/Turn 编排、模型结果聚合、停止规则、Checkpoint 触发 | Provider 私有 wire 逻辑 |
 | `shell` | 命令策略、有界进程运行器、Sandbox 适配器 | Agent Loop 决策 |
 | `secrets` | keyring 存储、密钥引用、脱敏 | 持久化明文密钥 |
 | `audit` | 哈希链安全记录与验证 | 通用会话 Trace |
@@ -135,6 +147,12 @@ tool.call.started / tool.call.completed / tool.call.failed
 policy.decision / approval.requested / approval.decided
 sandbox.decision / claim.acquired / claim.conflict
 context.built / context.truncated
+context.compacted / context.compaction.failed / context.reset
+context.anchor.added / context.anchor.removed
+checkpoint.created / checkpoint.invalid / checkpoint.pruned
+recovery.started / recovery.completed / recovery.failed
+recovery.tool.reconciled / recovery.process.terminated / recovery.claims.released
+session.forked
 model.text.delta / model.thinking.delta / tool.started / tool.finished
 ```
 
@@ -142,7 +160,7 @@ model.text.delta / model.thinking.delta / tool.started / tool.finished
 
 ## 持久化
 
-SQLite（WAL）是状态真源。截至阶段 2 的表：
+SQLite（WAL）是状态真源。截至阶段 3 的表：
 
 - `schema_meta`——迁移版本。
 - `sessions`——cwd、标题、状态、模型/Provider、`last_seq`、租约字段。
@@ -150,13 +168,44 @@ SQLite（WAL）是状态真源。截至阶段 2 的表：
 - `messages`——内部消息 JSON，按会话排序。
 - `tool_calls`——running/completed/failed/unknown，含参数与结果摘要。
 - `model_calls`——Token 用量与延迟。
-- `artifacts`——预留给大输出（阶段 3）。
+- `artifacts`——内容寻址的大输出/摘要，含 kind 与元数据。
 - `approvals`——精确指纹、带作用域和过期时间的授权。
 - `file_claims`——文件/树 Claim，含 lease owner 与过期时间。
 - `secret_names`——仅名称；值存放在 OS keyring。
 - `audit_log`——append-only 记录，含 `prev_hash`/`hash`。
+- `checkpoints`——不可变状态快照、checksum、schema version。
+- `compactions`——L1-L4 压缩记录、覆盖消息范围、before/after token、artifact。
+- `context_anchors`——跨压缩保留的关键事实。
+- `context_state`——generation、最近压缩、L3 失败熔断状态。
+- `process_records`——运行中的 Shell 进程（pid/pgid/owner），用于崩溃恢复。
+- `sessions.parent_session_id` / `fork_message_seq` / `fork_checkpoint_id`——Fork 来源。
 
-所有多行变更都使用显式 `BEGIN IMMEDIATE` 事务。消息行与其消息事件一起写入；工具调用行通过 Repository 事务更新。
+所有多行变更都使用显式 `BEGIN IMMEDIATE` 事务。消息行与其消息事件一起写入；工具调用行通过 Repository 事务更新。所有会话状态写入默认读取 ambient LeaseFence，并在同一事务中校验 owner/epoch/过期时间。
+
+## 上下文压缩
+
+压缩是 Transcript 之上的只读视图：
+
+```text
+messages (immutable)
+  + compactions (ordered, immutable; L2/L3 may supersede older summaries)
+  + anchors (mutable, pinned)
+  -> apply_compactions()
+  -> pinned system messages + recent turns
+  -> ContextBuilder budget/selection
+```
+
+L1 把旧工具输出写入 artifact 并替换为预览；L2 生成确定性摘要；L3 调用模型并在失败时回退 L2；L4 先创建 Checkpoint，再重置旧历史。原始消息行永不修改，每次有损重写都有 compaction 行与 artifact 引用。模型可通过 `read_artifact` 按 id 读回被归档的输出；该工具只允许读取当前 Session 的 artifact，并在读取时校验 SHA-256。
+
+## Checkpoint 与恢复
+
+Checkpoint 保存指针（event/message 序号）与无法从 Transcript 推导的状态（context generation、anchors、工具快照）。checksum 覆盖 session、kind、序号、状态与 schema version。损坏或不兼容的 Checkpoint 会被忽略并记录事件，Transcript 仍是事实来源。
+
+恢复只修复可安全修复的中间态：尾部的悬空 tool_call 会得到明确的 “unknown / 未自动重试” 合成结果；非幂等工具不会自动重放；旧 Claim 释放；遗留 Shell 进程经身份校验后终止。审计链损坏时 fail-closed。
+
+## Session Fork
+
+Fork 在单个事务中复制 `1..cut` 消息与活跃 anchors，创建新 Session ID，并记录 lineage。安全切点会回退到不完整 tool_call 之前。执行状态（tool_calls、model_calls、claims、approvals、processes、checkpoints、compactions）不继承；新会话必须重新获取 Lease/Claim 与审批。
 
 ## 租约、Claim 与并发
 

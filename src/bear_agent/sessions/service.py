@@ -16,6 +16,7 @@ from typing import Any
 from bear_agent.core.clock import Clock, SystemClock
 from bear_agent.core.errors import StorageError
 from bear_agent.core.events import Event, EventType
+from bear_agent.core.fencing import LeaseFence, resolve_fence
 from bear_agent.core.messages import (
     AssistantMessage,
     Message,
@@ -32,6 +33,7 @@ from bear_agent.storage.repositories import (
     SessionRepository,
     ToolCallRepository,
     _iso,
+    assert_session_lease_row,
 )
 
 
@@ -88,11 +90,18 @@ class SessionService:
     async def list_recent(self, limit: int = 50) -> list[SessionRecord]:
         return await self.sessions.list_recent(limit)
 
-    async def set_title(self, session_id: str, title: str) -> None:
-        await self.sessions.update_title(session_id, title)
+    async def set_title(
+        self, session_id: str, title: str, *, fence: LeaseFence | None = None
+    ) -> None:
+        await self.sessions.update_title(session_id, title, fence=fence)
 
-    async def set_status(self, session_id: str, status: str) -> None:
-        await self.sessions.update_status(session_id, status)
+    async def set_status(
+        self, session_id: str, status: str, *, fence: LeaseFence | None = None
+    ) -> None:
+        await self.sessions.update_status(session_id, status, fence=fence)
+
+    async def assert_lease(self, session_id: str, fence: LeaseFence) -> None:
+        await self.sessions.assert_lease(session_id, fence.owner, epoch=fence.epoch)
 
     # --------------------------------------------------------------- transcript
 
@@ -106,7 +115,9 @@ class SessionService:
         run_id: str | None = None,
         turn_id: str | None = None,
         token_estimate: int | None = None,
+        fence: LeaseFence | None = None,
     ) -> tuple[int, Event]:
+        fence = resolve_fence(fence)
         event = Event(
             session_id=session_id,
             type=event_type,
@@ -116,7 +127,9 @@ class SessionService:
             ts=self.clock.now(),
         )
         return await self.db.run(
-            lambda conn: self._append_message_sync(conn, session_id, message, event, token_estimate)
+            lambda conn: self._append_message_sync(
+                conn, session_id, message, event, token_estimate, fence
+            )
         )
 
     def _append_message_sync(
@@ -126,8 +139,11 @@ class SessionService:
         message: Message,
         event: Event,
         token_estimate: int | None,
+        fence: LeaseFence | None = None,
     ) -> tuple[int, Event]:
         with transaction(conn):
+            if fence is not None:
+                assert_session_lease_row(conn, session_id, fence)
             row = conn.execute(
                 "SELECT last_seq FROM sessions WHERE id = ?", (session_id,)
             ).fetchone()
@@ -186,7 +202,12 @@ class SessionService:
             return message_seq, enriched
 
     async def append_user_message(
-        self, session_id: str, text: str, *, run_id: str | None = None
+        self,
+        session_id: str,
+        text: str,
+        *,
+        run_id: str | None = None,
+        fence: LeaseFence | None = None,
     ) -> tuple[int, Event]:
         return await self.append_message(
             session_id,
@@ -194,6 +215,7 @@ class SessionService:
             event_type=EventType.MESSAGE_USER,
             run_id=run_id,
             payload={"chars": len(text)},
+            fence=fence,
         )
 
     async def append_assistant_message(
@@ -204,6 +226,7 @@ class SessionService:
         run_id: str | None = None,
         turn_id: str | None = None,
         payload: dict[str, Any] | None = None,
+        fence: LeaseFence | None = None,
     ) -> tuple[int, Event]:
         return await self.append_message(
             session_id,
@@ -212,6 +235,7 @@ class SessionService:
             run_id=run_id,
             turn_id=turn_id,
             payload=payload or {},
+            fence=fence,
         )
 
     async def append_tool_message(
@@ -222,6 +246,7 @@ class SessionService:
         run_id: str | None = None,
         turn_id: str | None = None,
         payload: dict[str, Any] | None = None,
+        fence: LeaseFence | None = None,
     ) -> tuple[int, Event]:
         return await self.append_message(
             session_id,
@@ -230,6 +255,7 @@ class SessionService:
             run_id=run_id,
             turn_id=turn_id,
             payload=payload or {},
+            fence=fence,
         )
 
     async def load_messages(self, session_id: str) -> list[Message]:
@@ -250,9 +276,20 @@ class SessionService:
 
     # --------------------------------------------------------------- recovery
 
-    async def mark_interrupted_tools_unknown(self, session_id: str) -> int:
+    async def mark_interrupted_tools_unknown(
+        self, session_id: str, *, fence: LeaseFence | None = None
+    ) -> int:
         """After a crash, running tool calls are not known to have completed."""
-        return await self.tool_calls.mark_running_unknown(session_id)
+        return await self.tool_calls.mark_running_unknown(session_id, fence=fence)
+
+    async def max_message_seq(self, session_id: str) -> int:
+        return await self.messages.max_seq(session_id)
+
+    async def tool_calls_for(self, session_id: str, limit: int = 500) -> list[dict[str, Any]]:
+        return await self.tool_calls.list_for_session(session_id, limit)
+
+    async def running_tool_calls(self, session_id: str) -> list[dict[str, Any]]:
+        return await self.tool_calls.list_running(session_id)
 
     async def usage_summary(self, session_id: str) -> UsageSummary:
         return await self.model_calls.usage_summary(session_id)
@@ -270,6 +307,7 @@ class SessionService:
         payload: dict[str, Any] | None = None,
         run_id: str | None = None,
         turn_id: str | None = None,
+        fence: LeaseFence | None = None,
     ) -> Event | None:
         events = await self.events.append(
             session_id,
@@ -283,5 +321,6 @@ class SessionService:
                     ts=self.clock.now(),
                 )
             ],
+            fence=fence,
         )
         return events[0] if events else None

@@ -37,6 +37,38 @@ class ContextOverflowError(BearError):
     pass
 
 
+class CompactionError(BearError):
+    pass
+
+
+class CheckpointError(BearError):
+    pass
+
+
+class CheckpointCorrupt(CheckpointError):
+    pass
+
+
+class CheckpointIncompatible(CheckpointError):
+    pass
+
+
+class RecoveryError(BearError):
+    pass
+
+
+class ForkError(BearError):
+    pass
+
+
+class ArtifactError(BearError):
+    pass
+
+
+class ArtifactCorrupt(ArtifactError):
+    pass
+
+
 class ClaimError(BearError):
     pass
 

@@ -12,7 +12,9 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
 from bear_agent.core.errors import ClaimConflict, ClaimError
+from bear_agent.core.fencing import LeaseFence, resolve_fence
 from bear_agent.storage.database import Database, transaction
+from bear_agent.storage.repositories import assert_session_lease_row
 
 
 def _iso(value: datetime) -> str:
@@ -301,6 +303,43 @@ class ClaimRepository:
             (session_id, lease_owner),
         )
         return cursor.rowcount
+
+    async def release_session_except_owner(
+        self,
+        session_id: str,
+        lease_owner: str,
+        *,
+        fence: LeaseFence | None = None,
+    ) -> list[str]:
+        fence = resolve_fence(fence)
+        return await self.db.run(
+            lambda conn: self._release_session_except_owner(conn, session_id, lease_owner, fence)
+        )
+
+    def _release_session_except_owner(
+        self,
+        conn: sqlite3.Connection,
+        session_id: str,
+        lease_owner: str,
+        fence: LeaseFence | None = None,
+    ) -> list[str]:
+        with transaction(conn):
+            if fence is not None:
+                # The fence check and the delete share a transaction: a
+                # recovery whose lease expired must not delete the new owner's
+                # live claims.
+                assert_session_lease_row(conn, session_id, fence)
+            rows = conn.execute(
+                "SELECT path FROM file_claims WHERE session_id = ? AND lease_owner != ?",
+                (session_id, lease_owner),
+            ).fetchall()
+            paths = [str(row["path"]) for row in rows]
+            if paths:
+                conn.execute(
+                    "DELETE FROM file_claims WHERE session_id = ? AND lease_owner != ?",
+                    (session_id, lease_owner),
+                )
+        return paths
 
     async def release_one(self, session_id: str, lease_owner: str, path: str) -> None:
         await self.db.run(lambda conn: self._release_one(conn, session_id, lease_owner, path))

@@ -49,6 +49,9 @@ class Message(BaseModel):
     role: Literal["system", "user", "assistant", "tool"]
     parts: list[Part] = Field(default_factory=list)
     name: str | None = None
+    # Local transcript sequence; intentionally ignored by provider adapters.
+    # Assigned when loading from / appending to the session transcript.
+    seq: int | None = None
 
     def text_content(self) -> str:
         return "".join(p.text for p in self.parts if isinstance(p, TextPart))

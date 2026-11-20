@@ -7,7 +7,7 @@ turn is dropped first; only the newest turn may have its tool output truncated.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from bear_agent.context.prompt import build_system_prompt
@@ -33,6 +33,11 @@ class BuiltContext:
     dropped_messages: int
     truncated: bool
     budget_tokens: int
+    # Tokens occupied by pinned history system messages (compaction summaries,
+    # injected system notes). They are never dropped by turn selection.
+    pinned_tokens: int = 0
+    compacted: bool = False
+    compaction_ids: list[str] = field(default_factory=list)
 
 
 class ContextBuilder:
@@ -55,7 +60,12 @@ class ContextBuilder:
         )
         self.system_message = SystemMessage.of(self.system_prompt)
 
-    def build(self, messages: list[Message], tools: list[ToolSpec]) -> BuiltContext:
+    def available_budget(self, tools: list[ToolSpec]) -> int:
+        """History budget left after the fixed system prompt, tools and margin.
+
+        This is the same arithmetic ``build`` uses for its history selection;
+        the compactor uses it to decide when to trigger.
+        """
         system_tokens = estimate_message_tokens(self.system_message)
         tool_tokens = estimate_tool_specs_tokens([tool.model_dump(mode="json") for tool in tools])
         budget = (
@@ -70,17 +80,61 @@ class ContextBuilder:
                 "the system prompt and tool schemas do not fit in the configured "
                 "context window; increase context_window or reduce max_output_tokens"
             )
+        return budget
+
+    def build(
+        self,
+        messages: list[Message],
+        tools: list[ToolSpec],
+        *,
+        system_extra: str = "",
+    ) -> BuiltContext:
+        extra_message = SystemMessage.of(system_extra) if system_extra.strip() else None
+        system_tokens = estimate_message_tokens(self.system_message)
+        if extra_message is not None:
+            system_tokens += estimate_message_tokens(extra_message)
+        tool_tokens = estimate_tool_specs_tokens([tool.model_dump(mode="json") for tool in tools])
+        budget = (
+            self.context_window
+            - self.max_output_tokens
+            - SAFETY_MARGIN_TOKENS
+            - system_tokens
+            - tool_tokens
+        )
+        if budget <= 0:
+            raise ContextOverflowError(
+                "the system prompt and tool schemas do not fit in the configured "
+                "context window; increase context_window or reduce max_output_tokens"
+            )
+
+        pinned = [message for message in messages if message.role == "system"]
+        pinned_tokens = estimate_messages_tokens(pinned)
+        if pinned_tokens > budget:
+            raise ContextOverflowError(
+                "pinned system messages alone exceed the available context budget; "
+                "reduce the number of pinned system messages or raise context_window"
+            )
+        history_budget = budget - pinned_tokens
+        system_prefix: list[Message] = [self.system_message]
+        if extra_message is not None:
+            system_prefix.append(extra_message)
 
         groups = _group_by_user_turn(messages)
         if not groups:
             return BuiltContext(
-                messages=[self.system_message],
+                messages=[*system_prefix, *pinned],
                 system_tokens=system_tokens + tool_tokens,
                 history_tokens=0,
-                estimated_tokens=system_tokens + tool_tokens,
+                estimated_tokens=system_tokens + tool_tokens + pinned_tokens,
                 dropped_messages=0,
                 truncated=False,
                 budget_tokens=budget,
+                pinned_tokens=pinned_tokens,
+            )
+        if history_budget <= 0:
+            raise ContextOverflowError(
+                "pinned system messages leave no room for the conversation history; "
+                "reduce the number of pinned messages or raise context_window"
             )
 
         selected: list[list[Message]] = []
@@ -89,33 +143,35 @@ class ContextBuilder:
         for group in reversed(groups):
             group_tokens = estimate_messages_tokens(group)
             if not selected:
-                if group_tokens > budget:
-                    group, group_tokens, was_truncated = _shrink_group(group, budget)
+                if group_tokens > history_budget:
+                    group, group_tokens, was_truncated = _shrink_group(group, history_budget)
                     truncated = truncated or was_truncated
                 selected.append(group)
                 used += group_tokens
-            elif used + group_tokens <= budget:
+            elif used + group_tokens <= history_budget:
                 selected.append(group)
                 used += group_tokens
             else:
                 break
         selected.reverse()
         selected_messages = [message for group in selected for message in group]
-        dropped = max(0, len(messages) - len(selected_messages))
-        total = system_tokens + tool_tokens + used
+        total_history = sum(len(group) for group in groups)
+        dropped = max(0, total_history - len(selected_messages))
+        total = system_tokens + tool_tokens + pinned_tokens + used
         if total > self.context_window - self.max_output_tokens:
             raise ContextOverflowError(
                 "the latest turn is too large for the context window even after "
                 "truncating tool output; shorten the request or raise context_window"
             )
         return BuiltContext(
-            messages=[self.system_message, *selected_messages],
+            messages=[*system_prefix, *pinned, *selected_messages],
             system_tokens=system_tokens + tool_tokens,
             history_tokens=used,
             estimated_tokens=total,
             dropped_messages=dropped,
             truncated=truncated,
             budget_tokens=budget,
+            pinned_tokens=pinned_tokens,
         )
 
 

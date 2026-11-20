@@ -11,6 +11,7 @@ from typing import Any
 
 from bear_agent.core.errors import StorageError
 from bear_agent.core.events import PERSISTED_EVENT_TYPES, Event, EventType
+from bear_agent.core.fencing import LeaseFence
 from bear_agent.observability.bus import EventBus
 from bear_agent.secrets.redaction import SecretRedactor
 from bear_agent.sessions.service import SessionService
@@ -36,6 +37,7 @@ class EventRecorder:
         run_id: str | None = None,
         turn_id: str | None = None,
         persist: bool | None = None,
+        fence: LeaseFence | None = None,
     ) -> Event:
         should_persist = event_type in PERSISTED_EVENT_TYPES if persist is None else persist
         safe_payload = self.redactor.redact_obj(payload or {})
@@ -46,6 +48,7 @@ class EventRecorder:
                 payload=safe_payload,
                 run_id=run_id,
                 turn_id=turn_id,
+                fence=fence,
             )
             if event is None:
                 raise StorageError(f"event type {event_type.value!r} is not persistable")

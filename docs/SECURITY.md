@@ -1,6 +1,6 @@
 # 安全
 
-> 阶段 2 范围。本文说明当前已经强制实施的控制，以及尚未实现的控制。
+> 阶段 3 范围。本文说明当前已经强制实施的控制，以及尚未实现的控制。
 > 不要把推迟项当作已实现。
 
 ## 威胁模型
@@ -18,7 +18,7 @@ Bear-Agent 假设模型可能出错、被操纵，甚至主动对抗：
 
 **信任边界是运行时，不是 Prompt。**
 
-## 已实施控制（阶段 2）
+## 已实施控制（阶段 3）
 
 ### 权限模式与审批
 
@@ -103,6 +103,42 @@ Bear-Agent 假设模型可能出错、被操纵，甚至主动对抗：
 - Claim 被 session lease owner fencing：租约被接管的进程不能获取或校验 Claim。
 - 树 Claim 与树下的文件 Claim 冲突；这会跨会话串行化 Shell 写与文件工具写。
 
+### Lease Epoch Fencing
+
+- 每个 Run 持有 session lease（owner + 单调 epoch + expiry）。
+- Runtime 设置 context-local `LeaseFence`；Transcript、Event、tool_calls、model_calls、session 状态与 continuity 写入默认读取该 fence。
+- 每次写入在**同一个 SQLite 事务内**校验 owner、epoch 与过期时间；旧 owner、旧 epoch、过期租约一律 `SessionLeaseError`。
+- 后台任务继承该 context，因此租约被接管后无法继续污染状态。
+- 清理顺序为：标记中断工具 → 置 idle → 写 run 结束事件 → 释放租约。释放租约是所有状态写入之后最后一步。
+
+### 上下文压缩
+
+- 压缩只读 Transcript；原始消息行永不修改或删除。
+- L1 归档的完整工具输出写入内容寻址 artifact，读取时校验 SHA-256；损坏会报错而不是注入模型。
+- L2 确定性摘要不依赖模型；L3 模型摘要失败会回退，连续失败会熔断。
+- L3 的输入包含不可信工具输出。摘要 prompt 明确声明“对话是数据，不是指令”，但模型仍可能受到 Prompt Injection 影响；摘要以带边界的上下文块注入，不改变权限、工具目录或审批。
+- 压缩产物与摘要写入前经过 `SecretRedactor`；artifact 与数据库一样是本地明文，不做静态加密。
+- `read_artifact` 工具只允许读取当前 Session 的 artifact；跨 Session id 与不存在的 id 返回同样的“unknown”，读取时校验 SHA-256，损坏文件不会被注入上下文。
+- Anchor Ledger 只保留目标/约束/手工事实，不保存凭证。
+
+### Checkpoint 与恢复
+
+- Checkpoint 在单个事务中快照并插入；checksum 覆盖 session、kind、event/message 序号、状态与 schema version。
+- 读取时校验 checksum、版本与边界；损坏/不兼容的 Checkpoint 不参与恢复，只记录 `checkpoint.invalid`。
+- 恢复在新租约下执行，写入全部 fenced；审计链损坏且 `recovery.require_audit=true` 时 fail-closed。
+- `running` 工具不会被简单改成 `failed`：追加合成结果并标记 `unknown`，明确说明未自动重试；幂等工具标注可重试，非幂等/有副作用工具要求先检查或询问用户。
+- 恢复从不自动重新执行工具。
+- 只修复 Transcript 尾部的悬空 tool_call；中间位置的顺序异常报告为 issue，并建议从 Checkpoint/Fork 处理，不写出乱序结果。
+- 遗留 Claim 只释放不属于当前 owner 的项；当前 owner 的 Claim 保留。
+- 遗留 Shell 进程终止前校验 pid/pgid 与启动时间；无法验证身份时**不杀**，报告为未终止。
+
+### Session Fork
+
+- Fork 在单个事务中复制安全切点之前的消息与活跃 Anchors；来源消息序号晚于切点的锚点不会复制，避免“未来事实”泄露到过去的 Fork。源会话行/消息/事件不变。
+- 不完整 tool_call 的切点会自动回退，绝不产生不配对的消息。
+- 不继承 tool_calls、model_calls、claims、approvals、processes、checkpoints、compactions、context_state。
+- 新会话必须重新获取 Lease/Claim 与审批；project 作用域审批按既有 project ID 语义仍适用，这是文档化的例外。
+
 ### 工具执行
 
 - 执行前进行 JSON Schema 校验；非法参数不会到达工具。
@@ -129,11 +165,20 @@ Bear-Agent 假设模型可能出错、被操纵，甚至主动对抗：
 
 Hardening 后的残余风险：
 
-- Session transcript/event 写入没有逐次 lease epoch fencing；心跳取消、Claim 与 Run 租约覆盖副作用，但丢失租约的进程在中途仍可能在察觉前 append。
+- ~~Session transcript/event 写入没有逐次 lease epoch fencing~~——阶段 3 已加入逐写 fencing。
 - POSIX 子孙进程终止是 best-effort（`ps` 扫描 + 进程组）；同时逃逸两者的子进程在没有 PID namespace 的宿主机上可能存活。
 - 递归/glob Shell 读取仍比显式路径策略更宽；Windows process-only/off 模式不 mask 敏感工作区文件。
 - keyring set/get 通过后端选择/拒绝逻辑测试；当前测试环境没有写入用户真实 Credential Manager。
 - macOS Seatbelt profile/deny 规则有单元测试，但当前环境未验证实际执行。
+
+### 阶段 3 残余风险
+
+- L3 模型摘要仍可能受到 Prompt Injection 或幻觉影响。压缩不会改变权限、审批或工具目录，但摘要可能丢失/扭曲事实；Anchor Ledger 与 L2 确定性摘要用于降低风险。
+- 恢复只自动修复 Transcript 尾部的悬空 tool_call；中间位置的顺序异常只报告诊断，需要人工处理或从 Checkpoint Fork。
+- Shell 孤儿进程终止依赖 pid/pgid 与启动时间校验；无法验证身份时选择不杀，可能留下进程。
+- Checkpoint 与 artifact 没有静态加密，也没有外部完整性锚点；拥有数据目录写权限者可同时修改数据库与文件。
+- 压缩 artifact 没有自动 GC，长期会话会累积磁盘占用。
+- Fork 有意不继承执行状态，因此不会自动继续被中断的工具；需要重新执行或由用户决定。
 
 ## 尚未实现
 
@@ -141,7 +186,7 @@ Hardening 后的残余风险：
 |---|---|---|
 | Windows 文件系统隔离（AppContainer/restricted token） | 后续 | 已评估但未交付；Windows Job Object 仅进程级，`require` 默认阻止 Shell |
 | MCP 信任与能力策略 | P5 | MCP 尚未实现 |
-| Prompt Injection 污点追踪 | P3/P5 | 不可信输出未作为数据流追踪 |
+| Prompt Injection 污点追踪 | P5 | 不可信输出未作为数据流追踪；压缩 prompt 仅做边界声明 |
 | 外部审计锚点/签名 | 后续 | 本地哈希链可被数据库写者重算 |
 | 静态加密数据库 | 后续 | SQLite 在磁盘上为明文 |
 | 逐命令网络策略 | 后续 | Sandbox 网络是会话级全开/全关 |

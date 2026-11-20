@@ -21,9 +21,11 @@ from bear_agent.core.cancel import CancelToken, RunCancelled
 from bear_agent.core.errors import (
     ContextOverflowError,
     ProviderError,
+    RecoveryError,
     SessionLeaseError,
 )
 from bear_agent.core.events import EventType
+from bear_agent.core.fencing import LeaseFence, reset_fence, set_fence
 from bear_agent.core.ids import new_id
 from bear_agent.core.usage import TokenUsage
 from bear_agent.observability.recorder import EventRecorder
@@ -33,7 +35,9 @@ from bear_agent.runtime.stop_policy import (
     StopPolicy,
 )
 from bear_agent.runtime.turn_executor import TurnExecutor
+from bear_agent.sessions.checkpoints import CheckpointService
 from bear_agent.sessions.claims import ClaimService
+from bear_agent.sessions.recovery import RecoveryService
 from bear_agent.sessions.service import SessionService
 
 logger = logging.getLogger(__name__)
@@ -70,6 +74,9 @@ class AgentRuntime:
         lease_ttl_s: float = 300.0,
         repeated_call_limit: int = 3,
         claims: ClaimService | None = None,
+        recovery: RecoveryService | None = None,
+        checkpoints: CheckpointService | None = None,
+        checkpoint_interval: int = 0,
     ) -> None:
         self.sessions = sessions
         self.turn_executor = turn_executor
@@ -80,6 +87,9 @@ class AgentRuntime:
         self.lease_ttl_s = lease_ttl_s
         self.repeated_call_limit = repeated_call_limit
         self.claims = claims
+        self.recovery = recovery
+        self.checkpoints = checkpoints
+        self.checkpoint_interval = checkpoint_interval
         self._locks: dict[str, asyncio.Lock] = {}
         self._active: dict[str, _ActiveRun] = {}
 
@@ -109,6 +119,8 @@ class AgentRuntime:
             run_id = new_id("run")
             owner = f"pid-{os.getpid()}-{run_id}"
             epoch = await self.sessions.acquire_lease(session_id, owner, self.lease_ttl_s)
+            fence = LeaseFence(owner=owner, epoch=epoch)
+            fence_token = set_fence(fence)
             cancel = CancelToken()
             active = _ActiveRun(cancel=cancel)
             active.task = cast(asyncio.Task[RunResult] | None, asyncio.current_task())
@@ -116,17 +128,6 @@ class AgentRuntime:
             stop_event = asyncio.Event()
             heartbeat = asyncio.create_task(
                 self._heartbeat(session_id, owner, epoch, cancel, stop_event)
-            )
-            await self.sessions.set_status(session_id, "active")
-            await self.recorder.record(
-                session_id,
-                EventType.RUN_STARTED,
-                run_id=run_id,
-                payload={
-                    "input_chars": len(user_input),
-                    "model": self.turn_executor.model,
-                    "provider": self.turn_executor.provider_name,
-                },
             )
             usage = TokenUsage()
             turns = 0
@@ -142,6 +143,26 @@ class AgentRuntime:
             stop_policy = StopPolicy(max_repeated_calls=self.repeated_call_limit)
 
             try:
+                await self.sessions.set_status(session_id, "active")
+                await self.recorder.record(
+                    session_id,
+                    EventType.RUN_STARTED,
+                    run_id=run_id,
+                    payload={
+                        "input_chars": len(user_input),
+                        "model": self.turn_executor.model,
+                        "provider": self.turn_executor.provider_name,
+                    },
+                )
+                if self.recovery is not None:
+                    report = await self.recovery.recover_if_needed(
+                        session_id, fence=fence, run_id=run_id
+                    )
+                    if report.blocked:
+                        detail = "; ".join(report.issues) or "unreconciled transcript state"
+                        raise RecoveryError(
+                            "session needs manual repair before a new turn: " + detail
+                        )
                 _, user_event = await self.sessions.append_user_message(
                     session_id, user_input, run_id=run_id
                 )
@@ -161,10 +182,29 @@ class AgentRuntime:
                         reason = f"turn budget exhausted ({self.max_turns})"
                         break
                     outcome = await self.turn_executor.execute(
-                        session, turns, run_id, owner, cancel
+                        session, turns, run_id, owner, cancel, lease_epoch=epoch
                     )
                     turns += 1
                     usage = usage + outcome.usage
+                    if (
+                        self.checkpoints is not None
+                        and self.checkpoint_interval > 0
+                        and turns % self.checkpoint_interval == 0
+                    ):
+                        try:
+                            await self.checkpoints.create(
+                                session_id,
+                                fence=fence,
+                                kind="turn",
+                                run_id=run_id,
+                                turn_index=turns - 1,
+                            )
+                        except SessionLeaseError:
+                            raise
+                        except Exception:
+                            # A checkpoint is a recovery aid, not a correctness
+                            # prerequisite; do not fail a healthy run for it.
+                            logger.exception("checkpoint creation failed")
                     if outcome.response.text:
                         final_text = outcome.response.text
                     tool_calls = len(outcome.assistant.tool_calls())
@@ -187,6 +227,14 @@ class AgentRuntime:
                 status = RunStatus.CONTEXT_OVERFLOW
                 reason = "context overflow"
                 error = str(exc)
+            except RecoveryError as exc:
+                status = RunStatus.FAILED
+                reason = "session recovery failed"
+                error = str(exc)
+            except SessionLeaseError as exc:
+                status = RunStatus.FAILED
+                reason = "session lease lost"
+                error = str(exc)
             except asyncio.CancelledError:
                 status = RunStatus.CANCELLED
                 reason = "run task cancelled"
@@ -207,10 +255,9 @@ class AgentRuntime:
                     [
                         (
                             "mark interrupted tools",
-                            self.sessions.mark_interrupted_tools_unknown(session_id),
+                            self.sessions.mark_interrupted_tools_unknown(session_id, fence=fence),
                         ),
-                        ("release lease", self.sessions.release_lease(session_id, owner, epoch)),
-                        ("set idle", self.sessions.set_status(session_id, "idle")),
+                        ("set idle", self.sessions.set_status(session_id, "idle", fence=fence)),
                         (
                             "record run end",
                             self._record_run_end(
@@ -224,6 +271,9 @@ class AgentRuntime:
                                 final_text,
                             ),
                         ),
+                        # Release must be last: all state writes above prove
+                        # that this run still owns the lease.
+                        ("release lease", self.sessions.release_lease(session_id, owner, epoch)),
                     ]
                 )
                 for label, awaitable in cleanup:
@@ -231,6 +281,7 @@ class AgentRuntime:
                         await awaitable
                     except Exception:
                         logger.exception("run cleanup failed: %s", label)
+                reset_fence(fence_token)
                 self._active.pop(session_id, None)
             return RunResult(
                 session_id=session_id,

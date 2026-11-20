@@ -12,8 +12,10 @@ import json
 from dataclasses import dataclass
 
 from bear_agent.context.builder import ContextBuilder
+from bear_agent.context.compaction import ContextCompactor
 from bear_agent.core.cancel import CancelToken
 from bear_agent.core.events import EventType
+from bear_agent.core.fencing import LeaseFence
 from bear_agent.core.ids import new_id
 from bear_agent.core.messages import AssistantMessage, ToolMessage
 from bear_agent.core.usage import TokenUsage
@@ -46,6 +48,7 @@ class TurnExecutor:
         tool_executor: ToolExecutor,
         registry: ToolRegistry,
         recorder: EventRecorder,
+        compactor: ContextCompactor | None = None,
         model: str,
         provider_name: str = "",
         temperature: float = 0.0,
@@ -58,6 +61,7 @@ class TurnExecutor:
         self.tool_executor = tool_executor
         self.registry = registry
         self.recorder = recorder
+        self.compactor = compactor
         self.model = model
         self.provider_name = provider_name
         self.temperature = temperature
@@ -71,6 +75,8 @@ class TurnExecutor:
         run_id: str,
         lease_owner: str,
         cancel: CancelToken,
+        *,
+        lease_epoch: int | None = None,
     ) -> TurnOutcome:
         turn_id = new_id("turn")
         await self.recorder.record(
@@ -82,7 +88,29 @@ class TurnExecutor:
         )
         messages = await self.sessions.load_messages(session.id)
         tools = self.registry.specs()
-        built = self.context_builder.build(messages, tools)
+        compaction_info: dict[str, object] = {}
+        if self.compactor is not None and lease_epoch is not None:
+            prepared = await self.compactor.prepare(
+                session,
+                messages,
+                tools,
+                turn_index=turn_index,
+                run_id=run_id,
+                turn_id=turn_id,
+                fence=LeaseFence(lease_owner, lease_epoch),
+                cancel=cancel,
+            )
+            messages_for_context = prepared.messages
+            system_extra = prepared.anchor_block
+            compaction_info = {
+                "compacted": prepared.compacted,
+                "compaction_ids": prepared.compaction_ids,
+                "compaction_levels": prepared.levels,
+            }
+        else:
+            messages_for_context = messages
+            system_extra = ""
+        built = self.context_builder.build(messages_for_context, tools, system_extra=system_extra)
         await self.recorder.record(
             session.id,
             EventType.CONTEXT_BUILT,
@@ -96,6 +124,7 @@ class TurnExecutor:
                 "dropped_messages": built.dropped_messages,
                 "truncated": built.truncated,
                 "budget_tokens": built.budget_tokens,
+                **compaction_info,
             },
         )
         if built.dropped_messages or built.truncated:
@@ -203,6 +232,7 @@ class TurnExecutor:
                 session_id=session.id,
                 project_id=session.project_id,
                 lease_owner=lease_owner,
+                lease_epoch=lease_epoch,
                 run_id=run_id,
                 turn_id=turn_id,
                 cancel=cancel,

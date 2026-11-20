@@ -34,19 +34,20 @@ uv run pytest tests/integration/test_runtime.py -k cancel -v
 src/bear_agent/
   core/          消息分段、事件、取消、错误、用量、枚举
   config/        Settings 模型、TOML 加载器、初始化模板
-  storage/       Database、迁移、Repository
-  sessions/      SessionRecord、SessionService、转录 + 租约
+  storage/       Database、迁移、Repository、continuity_repositories
+  sessions/      SessionRecord、SessionService、租约、Checkpoint、Recovery、Fork、Claims
   providers/     ModelProvider 端口、OpenAI 兼容适配器、重试
   tools/         Tool 契约、注册表、执行器、builtin/（含 shell）
-  shell/         命令策略、进程运行器、环境、sandbox/
+  shell/         命令策略、进程运行器、进程登记/恢复、环境、sandbox/
   policy/        PermissionEngine、PathGuard、审批服务、approver 端口
   secrets/       keyring 存储、密钥引用、脱敏
   audit/         哈希链安全日志
-  context/       System Prompt、Token 估算、ContextBuilder
-  runtime/       AgentRuntime、TurnExecutor、ModelCaller、StopPolicy
+  artifacts/     内容寻址 artifact 存储与完整性校验
+  context/       System Prompt、Token 估算、ContextBuilder、分层压缩、Anchor Ledger
+  runtime/       AgentRuntime、TurnExecutor、ModelCaller、Summarizer、StopPolicy
   observability/ EventBus、EventRecorder
   ui/cli/        Typer 命令、Rich 渲染器、CLI approver
-  bootstrap.py   组合根
+  bootstrap.py   组合根（Container + Maintenance）
 tests/
   unit/ integration/ security/ e2e/ support.py conftest.py
 ```
@@ -124,6 +125,17 @@ bear secret list            # 只看名称，不显示值
 - Linux：`bwrap` 可用时运行真实 bwrap 集成测试；CI 会安装它。
 - Windows：Job Object 执行测试在 Windows 上运行。
 - macOS：Seatbelt profile 构造测试全平台运行；实际执行依赖环境。
+
+## 上下文压缩、Checkpoint、恢复与 Fork
+
+- 压缩只能通过 `ContextCompactor.prepare()`/`force()`，再由 `ContextBuilder.build(prepared.messages, tools, system_extra=prepared.anchor_block)` 组装请求。不要直接修改 `messages` 表或删除历史。
+- 新增压缩层必须：只读 Transcript、写入 `compactions`/artifact、在 `summary` 中记录覆盖范围与 supersedes、有失败回退。
+- 新状态写入必须接受 `LeaseFence`，并在与写入相同的事务内调用 `assert_session_lease_row`。Runtime 已经设置 ambient fence；后台任务继承它，旧 owner 写入会被拒绝。
+- Checkpoint 只保存指针与控制状态，不复制 Transcript。新增字段要同步 `_validate_state_shape` 与 checksum 输入。
+- Recovery 不允许自动重新执行工具；合成结果必须明确状态未知与重试安全性。无法安全修复时设置 `report.blocked`。
+- Fork 不得修改源 Session；不复制执行状态、Claim、审批、进程与 Checkpoint 行。
+- 新持久化面（Checkpoint 状态、Anchors、artifact、进程预览、摘要）必须经过 `SecretRedactor`。
+- 测试：`uv run pytest tests/unit/test_compaction.py tests/unit/test_checkpoints.py tests/unit/test_recovery.py tests/unit/test_fork.py tests/unit/test_fencing.py tests/integration/test_compaction_runtime.py tests/integration/test_recovery_runtime.py tests/integration/test_fork_runtime.py -q`。
 
 ## 添加 Provider
 

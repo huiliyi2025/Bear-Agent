@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import os
 import platform
 import sys
 from pathlib import Path
@@ -21,7 +22,12 @@ from rich.table import Table
 
 from bear_agent import __version__
 from bear_agent.audit.service import AuditEntry, AuditService, AuditVerification
-from bear_agent.bootstrap import Container, build_container, permission_mode
+from bear_agent.bootstrap import (
+    Container,
+    build_container,
+    build_maintenance,
+    permission_mode,
+)
 from bear_agent.config.loader import (
     default_config_path,
     load_settings,
@@ -29,7 +35,8 @@ from bear_agent.config.loader import (
     write_default_config,
 )
 from bear_agent.config.models import Settings
-from bear_agent.core.errors import BearError
+from bear_agent.core.errors import BearError, CheckpointError
+from bear_agent.core.fencing import LeaseFence, reset_fence, set_fence
 from bear_agent.core.usage import TokenUsage
 from bear_agent.policy.approver import AutoApprover, DenyingApprover
 from bear_agent.runtime.stop_policy import RunStatus
@@ -198,6 +205,10 @@ HELP = """\
 /session              show current session id and status
 /permission <mode>    plan | supervised | auto | unrestricted
 /new                  start a new session
+/compact              force layered context compaction now
+/anchor <text>        pin a fact that compaction must keep
+/anchors              list active anchors
+/fork [message_seq]   fork this session at a safe position
 /exit                 quit
 """
 
@@ -328,6 +339,90 @@ async def _chat(
                         publish=container.bus.publish,
                     )
                     console.print(f"new session [dim]{session.id}[/dim]")
+                    continue
+                if text == "/anchors":
+                    for anchor in await container.anchors.active(session.id):
+                        console.print(
+                            f"  [cyan]{anchor.id}[/cyan] [{anchor.kind}] {anchor.text[:200]}"
+                        )
+                    continue
+                if text.startswith("/anchor "):
+                    value = text[len("/anchor ") :].strip()
+                    if not value:
+                        console.print("usage: /anchor <text>")
+                        continue
+                    owner = f"cli-{os.getpid()}"
+                    try:
+                        epoch = await container.sessions.acquire_lease(session.id, owner, 60.0)
+                    except BearError as exc:
+                        console.print(f"[red]{exc}[/red]")
+                        continue
+                    fence = LeaseFence(owner, epoch)
+                    token = set_fence(fence)
+                    try:
+                        anchor = await container.anchors.add(
+                            session.id, value, kind="manual", fence=fence
+                        )
+                    finally:
+                        reset_fence(token)
+                        with contextlib.suppress(Exception):
+                            await container.sessions.release_lease(session.id, owner, epoch)
+                    console.print(f"anchor [dim]{anchor.id}[/dim] pinned")
+                    continue
+                if text == "/compact":
+                    owner = f"cli-{os.getpid()}"
+                    try:
+                        epoch = await container.sessions.acquire_lease(session.id, owner, 120.0)
+                    except BearError as exc:
+                        console.print(f"[red]{exc}[/red]")
+                        continue
+                    fence = LeaseFence(owner, epoch)
+                    token = set_fence(fence)
+                    try:
+                        messages = await container.sessions.load_messages(session.id)
+                        prepared = await container.compactor.force(
+                            session,
+                            messages,
+                            container.registry.specs(),
+                            fence=fence,
+                            turn_index=0,
+                        )
+                    except Exception as exc:
+                        console.print(f"[red]compaction failed:[/red] {exc}")
+                        continue
+                    finally:
+                        reset_fence(token)
+                        with contextlib.suppress(Exception):
+                            await container.sessions.release_lease(session.id, owner, epoch)
+                    console.print(
+                        f"compacted levels={prepared.levels or 'none'} "
+                        f"tokens {prepared.before_tokens} -> {prepared.estimated_tokens}"
+                    )
+                    for note in prepared.notes:
+                        console.print(f"  [dim]{note}[/dim]")
+                    continue
+                if text == "/fork" or text.startswith("/fork "):
+                    at: int | None = None
+                    if text.startswith("/fork "):
+                        raw = text[len("/fork ") :].strip()
+                        try:
+                            at = int(raw)
+                        except ValueError:
+                            console.print("usage: /fork [message_seq]")
+                            continue
+                    try:
+                        forked = await container.fork.fork(
+                            session.id,
+                            at_message_seq=at,
+                            checkpoints=container.checkpoints,
+                        )
+                    except BearError as exc:
+                        console.print(f"[red]fork failed:[/red] {exc}")
+                        continue
+                    session = forked.session
+                    console.print(
+                        f"forked [cyan]{session.id}[/cyan] at message {forked.cut_message_seq}"
+                    )
                     continue
                 console.print(f"[red]unknown command:[/red] {text}")
                 continue
@@ -511,6 +606,17 @@ def sessions_show(
             if record is None:
                 _fail(f"session not found: {session_id}", code=2)
                 return
+            lineage = ""
+            if record.parent_session_id:
+                lineage = (
+                    f"\nparent  {record.parent_session_id}"
+                    f"\nfork at {record.fork_message_seq}"
+                    + (
+                        f"\nfork ckpt {record.fork_checkpoint_id}"
+                        if record.fork_checkpoint_id
+                        else ""
+                    )
+                )
             console.print(
                 Panel(
                     f"id      {record.id}\n"
@@ -518,7 +624,8 @@ def sessions_show(
                     f"status  {record.status}\n"
                     f"model   {record.model}\n"
                     f"title   {record.title}\n"
-                    f"seq     {record.last_seq}",
+                    f"seq     {record.last_seq}"
+                    f"{lineage}",
                     title="Session",
                 )
             )
@@ -542,6 +649,188 @@ def sessions_show(
             db.close()
 
     asyncio.run(_show())
+
+
+@sessions_app.command("fork")
+def sessions_fork(
+    session_id: str = typer.Argument(..., help="Source session id."),
+    config: Path | None = typer.Option(None, "--config"),
+    at: int | None = typer.Option(
+        None, "--at", min=0, help="Copy messages up to this message sequence."
+    ),
+    checkpoint: str | None = typer.Option(
+        None, "--checkpoint", help="Fork from this checkpoint's message position."
+    ),
+    title: str | None = typer.Option(None, "--title", help="Title for the new session."),
+) -> None:
+    """从历史位置或 Checkpoint 派生一个独立会话。"""
+    settings = _load(
+        config=config,
+        base_url=None,
+        api_key=None,
+        provider=None,
+        model=None,
+        permission=None,
+        max_turns=None,
+    )
+
+    async def _fork() -> None:
+        maintenance = build_maintenance(settings, cwd=Path.cwd())
+        try:
+            result = await maintenance.fork.fork(
+                session_id,
+                at_message_seq=at,
+                checkpoint_id=checkpoint,
+                title=title,
+                checkpoints=maintenance.checkpoints,
+            )
+            console.print(
+                f"forked [cyan]{result.session.id}[/cyan] "
+                f"from {session_id} at message {result.cut_message_seq}"
+            )
+            console.print(f"title: {result.session.title or '(none)'}")
+            console.print(f"continue with: bear chat --resume {result.session.id}")
+        finally:
+            await maintenance.close()
+
+    try:
+        asyncio.run(_fork())
+    except BearError as exc:
+        _fail(str(exc), code=2)
+    except Exception as exc:
+        _fail(f"fork failed: {exc}", code=1)
+
+
+@sessions_app.command("recover")
+def sessions_recover(
+    session_id: str = typer.Argument(..., help="Session id."),
+    config: Path | None = typer.Option(None, "--config"),
+) -> None:
+    """在持有租约的前提下执行一次崩溃恢复检查。"""
+    settings = _load(
+        config=config,
+        base_url=None,
+        api_key=None,
+        provider=None,
+        model=None,
+        permission=None,
+        max_turns=None,
+    )
+
+    async def _recover() -> bool:
+        maintenance = build_maintenance(settings, cwd=Path.cwd())
+        try:
+            record = await maintenance.sessions.get(session_id)
+            if record is None:
+                _fail(f"session not found: {session_id}", code=2)
+            owner = f"cli-recovery-{os.getpid()}"
+            try:
+                epoch = await maintenance.sessions.acquire_lease(session_id, owner, 120.0)
+            except BearError as exc:
+                _fail(f"cannot recover while another process holds the lease: {exc}", code=1)
+            fence = LeaseFence(owner, epoch)
+            token = set_fence(fence)
+            try:
+                report = await maintenance.recovery.recover_if_needed(session_id, fence=fence)
+            finally:
+                reset_fence(token)
+                with contextlib.suppress(Exception):
+                    await maintenance.sessions.release_lease(session_id, owner, epoch)
+            if not report.recovered:
+                console.print("no recovery needed")
+                return True
+            console.print(
+                f"[green]recovered[/green] tools={report.running_tools} "
+                f"synthesized={len(report.synthesized_tools)} "
+                f"claims={report.released_claims} "
+                f"processes={report.terminated_processes}"
+            )
+            if report.checkpoint_id:
+                console.print(f"checkpoint: [dim]{report.checkpoint_id}[/dim]")
+            for action in report.actions:
+                console.print(f"  - {action}")
+            for issue in report.issues:
+                console.print(f"[yellow]issue:[/yellow] {issue}")
+            if report.blocked:
+                console.print(
+                    "[red]session is blocked for new turns;[/red] inspect it or fork "
+                    "from an earlier checkpoint/message."
+                )
+            return not report.issues
+        finally:
+            await maintenance.close()
+
+    try:
+        ok = asyncio.run(_recover())
+    except typer.Exit:
+        raise
+    except BearError as exc:
+        _fail(str(exc), code=1)
+    except Exception as exc:
+        _fail(f"recovery failed: {exc}", code=1)
+    if not ok:
+        raise typer.Exit(code=1)
+
+
+@sessions_app.command("checkpoints")
+def sessions_checkpoints(
+    session_id: str = typer.Argument(..., help="Session id."),
+    config: Path | None = typer.Option(None, "--config"),
+    limit: int = typer.Option(20, "--limit", min=1, max=200),
+) -> None:
+    """列出并校验会话的 Checkpoint。"""
+    settings = _load(
+        config=config,
+        base_url=None,
+        api_key=None,
+        provider=None,
+        model=None,
+        permission=None,
+        max_turns=None,
+    )
+
+    async def _list() -> None:
+        maintenance = build_maintenance(settings, cwd=Path.cwd())
+        try:
+            record = await maintenance.sessions.get(session_id)
+            if record is None:
+                _fail(f"session not found: {session_id}", code=2)
+            rows = await maintenance.checkpoints.list(session_id, limit)
+            table = Table(title="Checkpoints")
+            table.add_column("id", style="cyan", no_wrap=True)
+            table.add_column("kind")
+            table.add_column("event")
+            table.add_column("message")
+            table.add_column("created")
+            table.add_column("integrity")
+            for row in rows:
+                try:
+                    await maintenance.checkpoints.validate(row)
+                    state = "[green]ok[/green]"
+                except CheckpointError as exc:
+                    state = f"[red]{type(exc).__name__}[/red]"
+                except Exception:
+                    state = "[red]invalid[/red]"
+                table.add_row(
+                    row.id,
+                    row.kind,
+                    str(row.event_seq),
+                    str(row.message_seq),
+                    row.created_at.strftime("%Y-%m-%d %H:%M"),
+                    state,
+                )
+            console.print(table)
+        finally:
+            await maintenance.close()
+
+    try:
+        asyncio.run(_list())
+    except typer.Exit:
+        raise
+    except BearError as exc:
+        _fail(str(exc), code=2)
+    except Exception as exc:
+        _fail(f"cannot list checkpoints: {exc}", code=1)
 
 
 # ---------------------------------------------------------------------- config
@@ -684,6 +973,31 @@ def doctor(
             "claims",
             "ok" if settings.claims.enabled else "warn",
             f"enabled={settings.claims.enabled} ttl={settings.claims.ttl_s:.0f}s",
+        )
+    )
+    checks.append(
+        (
+            "context",
+            "ok" if settings.context.compaction_enabled else "warn",
+            f"compaction={settings.context.compaction_enabled} "
+            f"trigger={settings.context.trigger_ratio} l3={settings.context.l3_enabled}",
+        )
+    )
+    checks.append(
+        (
+            "checkpoints",
+            "ok" if settings.checkpoints.enabled else "warn",
+            f"enabled={settings.checkpoints.enabled} "
+            f"every={settings.checkpoints.interval_turns} keep={settings.checkpoints.keep}",
+        )
+    )
+    checks.append(
+        (
+            "recovery",
+            "ok" if settings.recovery.enabled else "warn",
+            f"enabled={settings.recovery.enabled} "
+            f"kill_orphans={settings.recovery.kill_orphan_processes} "
+            f"require_audit={settings.recovery.require_audit}",
         )
     )
 

@@ -14,6 +14,7 @@ import os
 from datetime import timedelta
 
 from bear_agent.core.clock import Clock, SystemClock
+from bear_agent.core.fencing import LeaseFence
 from bear_agent.core.ids import new_id
 from bear_agent.policy.path_guard import PathGuard
 from bear_agent.storage.security_repositories import ClaimRecord, ClaimRepository
@@ -74,6 +75,23 @@ class ClaimService:
 
     async def release_owner(self, session_id: str, lease_owner: str) -> int:
         return await self.repository.release_owner(session_id, lease_owner)
+
+    async def release_stale(
+        self,
+        session_id: str,
+        lease_owner: str,
+        *,
+        fence: LeaseFence | None = None,
+    ) -> list[str]:
+        """Drop claims left behind by an earlier lease owner.
+
+        Called by recovery after the new owner has taken the lease. The
+        session's own claims for the current owner are never touched. When a
+        fence is supplied, the owner/epoch check and the delete are atomic.
+        """
+        return await self.repository.release_session_except_owner(
+            session_id, lease_owner, fence=fence
+        )
 
     async def release_one(self, session_id: str, lease_owner: str, raw_path: str) -> None:
         await self.repository.release_one(session_id, lease_owner, self.normalize(raw_path))

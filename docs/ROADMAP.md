@@ -9,8 +9,8 @@
 | P0 | 调研与架构基线 | 已完成 |
 | P1 | 内核基础 | **已完成** |
 | P2 | Shell 执行与执行安全 | **已完成** |
-| P3 | 上下文压缩 + Checkpoint + 恢复 | 下一阶段 |
-| P4 | 持久化 Task / Plan / Todo 引擎 | 计划中 |
+| P3 | 上下文压缩 + Checkpoint + 恢复 | **已完成** |
+| P4 | 持久化 Task / Plan / Todo 引擎 | 下一阶段 |
 | P5 | Hooks、插件、MCP、Provider Fallback | 计划中 |
 | P6 | 可观测性、Trace、评估 | 计划中 |
 | P7 | TUI、打包、发布工程 | 计划中 |
@@ -139,23 +139,54 @@
 - 两个 Session 不能并发写同一文件或运行冲突的 Shell/树 Claim；过期 Claim 可回收，旧 lease owner 不能写。
 - 全量测试、ruff、format、mypy、CI 通过；文档与实现一致。
 
-## P3——上下文压缩 + Checkpoint + 恢复
+## P3——上下文压缩 + Checkpoint + 恢复（已完成）
+
+> 完成报告：[P3-COMPLETION-REPORT.md](P3-COMPLETION-REPORT.md)。
 
 ### 范围
 
-- L1 工具结果裁剪、L2 陈旧轮摘要、L3 结构化 LLM 摘要、L4 Checkpoint/会话分裂。
-- 锚点账本（目标、约束、决策、文件、错误、验证状态）。
-- Artifact 存储与 `recall`/`read_artifact`。
-- 风险操作前与步骤边界的 Checkpoint 快照。
-- 从快照 + 事件重放进行崩溃恢复。
-- Session Fork。
+- L1 工具结果归档、L2 确定性摘要、L3 结构化 LLM 摘要、L4 Checkpoint 重置。
+- 锚点账本（目标、约束、手工事实）。
+- Artifact 存储（内容寻址、读取校验）与 `read_artifact` 工具（session 隔离、按字符偏移读取）。
+- 检查点状态快照（指针 + 控制状态、checksum、版本、保留策略）。
+- 从 Transcript + Checkpoint 诊断进行崩溃恢复；不自动重放副作用。
+- Transcript/Event/tool/model 状态的 Lease Epoch Fencing。
+- Session Fork（历史位置或 Checkpoint）。
 
-### 验收
+### 已交付
 
-- 长会话压缩后不丢失任务状态与验收标准。
-- 每次有损重写都有 artifact 引用。
-- 被 kill 的进程可以从安全点恢复，不重放副作用。
-- 摘要质量检查覆盖全部锚点类别。
+- `context/compaction.py`：L1-L4、预算触发、目标余量、supersede、失败回退、L3 熔断、事件 + 审计、artifact。
+- `context/anchors.py`：Anchor Ledger、自动目标/约束提取、去重、预算化渲染、脱敏。
+- `context/builder.py`：pinned system 消息、`system_extra`、`available_budget`，压缩视图接入。
+- `artifacts/store.py`：原子写入、SHA-256 路径、读取校验、脱敏。
+- Schema v3/v4：checkpoints、compactions、context_anchors、context_state、process_records、Session Fork 列、artifact kind/metadata。
+- `sessions/checkpoints.py`：单事务快照、checksum、版本/边界校验、保留策略、损坏诊断。
+- `sessions/recovery.py`：审计链 fail-closed、尾部悬空 tool_call 合成 “unknown/未重试”、不可修复状态阻塞、旧 Claim 清理、孤儿进程终止。
+- `shell/process_registry.py`：进程登记、身份校验（POSIX /proc 或 ps、Windows GetProcessTimes）、安全终止。
+- `sessions/fork.py`：安全切点、单事务复制、lineage、Anchors 继承、执行状态隔离。
+- Runtime：启动前恢复、逐 Turn Checkpoint、RecoveryError/SessionLeaseError 结构化失败、cleanup 顺序修正。
+- Lease Epoch Fencing：ambient `LeaseFence` + Repository 同事务校验；旧 owner 写入拒绝。
+- CLI：`sessions fork/recover/checkpoints`，交互 `/compact`、`/anchor`、`/anchors`、`/fork`。
+- 配置：`[context]`、`[checkpoints]`、`[recovery]`；doctor/CLI 可查看。
+
+### 验收证据
+
+- 单元 + 集成测试覆盖压缩各层、预算、失败回退、熔断、L4 重置、锚点保留；Checkpoint 创建/损坏/不兼容/保留/fencing；恢复的幂等/非幂等工具、Claim、进程、审计篡改、并发恢复；Fork 隔离与安全切点；旧 owner 写入拒绝；Transcript/Event 原子回滚。
+- 压缩前后 Transcript 逐字节不变；L1 artifact 可读且内容一致；请求使用压缩视图。
+- 崩溃模拟（running tool + 尾部悬空）可在下一次 Run 前恢复；中间悬空会阻塞并给出诊断。
+- 并发恢复通过 SQLite 租约串行化，只有一个恢复者。
+- 全量 pytest、ruff、format、mypy、build 通过（见 P3 Completion Report）。
+
+### 已知限制
+
+- Token 估算仍是启发式；L3 摘要质量依赖模型，仍可能受 Prompt Injection/幻觉影响。
+- 只自动修复 Transcript 尾部的悬空 tool_call；中间乱序只报告并阻塞。
+- 孤儿进程终止依赖 pid/pgid 与启动时间校验；无法验证身份时不杀。
+- Checkpoint/artifact 无静态加密与外部完整性锚点；artifact 无自动 GC。
+- L3 摘要调用未计入 `model_calls` 用量/成本统计。
+- Fork 不继承执行状态，不会自动继续被中断的工具。
+- 压缩 artifact 写入与 compaction 行之间不是跨资源事务，极端失败会留下未引用文件（内容寻址、无害）。
+- Fork 在单个 `BEGIN IMMEDIATE` 事务中复制整个历史；超大 Transcript 或源会话正在高频写入时，可能让其他写入等待到 busy timeout。建议在会话空闲时 Fork。
 
 ## P4——持久化 Task / Plan / Todo 引擎
 

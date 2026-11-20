@@ -89,6 +89,7 @@ class ToolExecutor:
         run_id: str | None,
         turn_id: str | None,
         cancel: CancelToken,
+        lease_epoch: int | None = None,
     ) -> ToolResult:
         if not call.id:
             call = call.model_copy(update={"id": new_id("call")})
@@ -161,6 +162,10 @@ class ToolExecutor:
             cancel=cancel,
             path_guard=self.path_guard,
             max_output_chars=self.max_output_chars,
+            tool_call_id=call.id,
+            lease_owner=lease_owner,
+            lease_epoch=lease_epoch,
+            extras={"redactor": self.redactor},
         )
         generic = self.policy.decide(tool, args)
         preflight: PreflightDecision | None

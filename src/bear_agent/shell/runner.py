@@ -14,11 +14,15 @@ import os
 import signal
 import sys
 import time
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from bear_agent.core.cancel import CancelToken, RunCancelled
 from bear_agent.shell.sandbox.base import SandboxedCommand
+
+ProcessStartHook = Callable[[int, int | None, str], Awaitable[str | None]]
+ProcessFinishHook = Callable[[str | None], Awaitable[None]]
 
 CREATE_NEW_PROCESS_GROUP = 0x00000200
 CREATE_NO_WINDOW = 0x08000000
@@ -56,6 +60,8 @@ class ShellRunner:
         timeout_s: float,
         cancel: CancelToken,
         max_output_bytes: int,
+        on_process_start: ProcessStartHook | None = None,
+        on_process_finish: ProcessFinishHook | None = None,
     ) -> ShellResult:
         started = time.monotonic()
         backend = sandboxed.backend
@@ -110,11 +116,35 @@ class ShellRunner:
                 error=f"failed to start process: {exc}",
             )
 
+        process_record_id: str | None = None
         try:
             if sandboxed.on_spawn is not None:
                 sandboxed.on_spawn(proc.pid)
             if sandboxed.resume is not None:
                 sandboxed.resume(proc.pid)
+            if on_process_start is not None:
+                try:
+                    process_record_id = await on_process_start(
+                        proc.pid,
+                        proc.pid if sys.platform != "win32" else None,
+                        command[:500],
+                    )
+                except Exception as exc:
+                    # Recovery-critical bookkeeping failed; do not leave an
+                    # untracked process running.
+                    await self._terminate(proc, sandboxed)
+                    return ShellResult(
+                        command=command,
+                        stdout="",
+                        stderr="",
+                        exit_code=None,
+                        duration_ms=int((time.monotonic() - started) * 1000),
+                        sandbox_backend=backend,
+                        sandboxed=sandboxed.sandboxed,
+                        sandbox_capabilities=capabilities,
+                        sandbox_note=sandboxed.note,
+                        error=f"process registration failed: {type(exc).__name__}: {exc}",
+                    )
             if cancel.is_cancelled:
                 raise RunCancelled("run cancelled before command wait")
             out_task = asyncio.create_task(_read_bounded(proc.stdout, max_output_bytes))
@@ -192,6 +222,9 @@ class ShellRunner:
                 error=f"{type(exc).__name__}: {exc}",
             )
         finally:
+            if on_process_finish is not None and process_record_id is not None:
+                with contextlib.suppress(Exception):
+                    await on_process_finish(process_record_id)
             _cleanup_sandbox(sandboxed)
 
     async def _spawn(

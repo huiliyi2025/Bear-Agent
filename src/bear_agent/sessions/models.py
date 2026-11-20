@@ -36,6 +36,9 @@ class SessionRecord(BaseModel):
     lease_owner: str | None = None
     lease_epoch: int = 0
     lease_expires_at: datetime | None = None
+    parent_session_id: str | None = None
+    fork_message_seq: int | None = None
+    fork_checkpoint_id: str | None = None
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     updated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 

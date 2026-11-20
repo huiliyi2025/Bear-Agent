@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 import pytest
@@ -125,6 +126,52 @@ def test_run_json_with_scripted_provider(tmp_path: Path, monkeypatch: pytest.Mon
     tailed = runner.invoke(main.app, ["audit", "tail", "--config", str(config)])
     assert tailed.exit_code == 0, tailed.output
     assert "Audit tail" in tailed.output
+
+
+def test_session_checkpoints_fork_and_recover_commands(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runner = CliRunner()
+    config = _config(tmp_path)
+    _patch_provider(monkeypatch, "answer")
+    ran = runner.invoke(main.app, ["run", "hello", "--config", str(config), "--json"])
+    assert ran.exit_code == 0, ran.output
+    created = [
+        json.loads(line)
+        for line in ran.output.splitlines()
+        if line.startswith("{") and json.loads(line).get("type") == "session.created"
+    ]
+    session_id = created[0]["session_id"]
+
+    checkpoints = runner.invoke(
+        main.app, ["sessions", "checkpoints", session_id, "--config", str(config)]
+    )
+    assert checkpoints.exit_code == 0, checkpoints.output
+    assert "Checkpoints" in checkpoints.output
+    assert "ok" in checkpoints.output
+
+    forked = runner.invoke(
+        main.app,
+        ["sessions", "fork", session_id, "--at", "1", "--config", str(config)],
+    )
+    assert forked.exit_code == 0, forked.output
+    match = re.search(r"forked\s+(ses_[A-Za-z0-9]+)", forked.output)
+    assert match, forked.output
+    forked_id = match.group(1)
+    shown = runner.invoke(main.app, ["sessions", "show", forked_id, "--config", str(config)])
+    assert shown.exit_code == 0, shown.output
+    assert "parent" in shown.output
+    assert session_id in shown.output
+
+    source = runner.invoke(main.app, ["sessions", "show", session_id, "--config", str(config)])
+    assert source.exit_code == 0, source.output
+    assert "parent" not in source.output
+
+    recovered = runner.invoke(
+        main.app, ["sessions", "recover", session_id, "--config", str(config)]
+    )
+    assert recovered.exit_code == 0, recovered.output
+    assert "no recovery needed" in recovered.output
 
 
 def test_secret_commands_with_in_memory_store(

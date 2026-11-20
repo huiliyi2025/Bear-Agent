@@ -61,6 +61,10 @@ class ToolContext:
     path_guard: PathGuard
     max_output_chars: int = 24_000
     extras: dict[str, Any] = field(default_factory=dict)
+    # Fencing data for side processes and state writes. Set by ToolExecutor.
+    tool_call_id: str | None = None
+    lease_owner: str | None = None
+    lease_epoch: int | None = None
     # Set by the executor after policy/approval allow execution. Tools with
     # their own preflight (shell) use this to refuse direct-call bypasses.
     approved: bool = False

@@ -168,6 +168,81 @@ class ApprovalConfig(BaseModel):
     project_ttl_s: float = 2_592_000.0
 
 
+class ContextConfig(BaseModel):
+    """Layered context compaction policy.
+
+    L1 prunes old tool output into artifacts, L2 builds a deterministic
+    summary, L3 asks the model for a summary and L4 resets the working context
+    at a checkpoint. Each level only runs when the previous one did not bring
+    the estimated request below the trigger threshold.
+    """
+
+    compaction_enabled: bool = True
+    trigger_ratio: float = 0.82
+    keep_recent_turns: int = 2
+    l1_enabled: bool = True
+    l1_min_tool_chars: int = 4_000
+    l1_keep_chars: int = 1_000
+    l2_enabled: bool = True
+    l2_max_summary_tokens: int = 1_500
+    l3_enabled: bool = True
+    l3_max_input_tokens: int = 24_000
+    l3_failure_limit: int = 3
+    l3_cooldown_turns: int = 5
+    l4_enabled: bool = True
+    anchors_enabled: bool = True
+    anchor_max_tokens: int = 800
+    summary_model: str = ""
+
+    @field_validator("trigger_ratio")
+    @classmethod
+    def _ratio(cls, value: float) -> float:
+        if not 0.0 < value <= 1.0:
+            raise ValueError("must be in (0, 1]")
+        return value
+
+    @field_validator(
+        "keep_recent_turns",
+        "l1_min_tool_chars",
+        "l1_keep_chars",
+        "l2_max_summary_tokens",
+        "l3_max_input_tokens",
+        "l3_failure_limit",
+        "l3_cooldown_turns",
+        "anchor_max_tokens",
+    )
+    @classmethod
+    def _non_negative(cls, value: int) -> int:
+        if value < 0:
+            raise ValueError("must not be negative")
+        return value
+
+
+class CheckpointConfig(BaseModel):
+    enabled: bool = True
+    # 0 disables automatic per-turn checkpoints; manual and pre-compaction
+    # checkpoints are still created.
+    interval_turns: int = 1
+    keep: int = 20
+
+    @field_validator("interval_turns", "keep")
+    @classmethod
+    def _non_negative(cls, value: int) -> int:
+        if value < 0:
+            raise ValueError("must not be negative")
+        return value
+
+
+class RecoveryConfig(BaseModel):
+    enabled: bool = True
+    # Kill shell processes registered by a run whose lease was lost. The
+    # process registry verifies identity before signalling.
+    kill_orphan_processes: bool = True
+    # Recovery actions are security-relevant; refuse to proceed if the audit
+    # chain cannot be appended.
+    require_audit: bool = True
+
+
 class Settings(BaseModel):
     providers: dict[str, ProviderConfig] = Field(
         default_factory=lambda: {"default": ProviderConfig()}
@@ -180,6 +255,9 @@ class Settings(BaseModel):
     audit: AuditConfig = Field(default_factory=AuditConfig)
     claims: ClaimsConfig = Field(default_factory=ClaimsConfig)
     approvals: ApprovalConfig = Field(default_factory=ApprovalConfig)
+    context: ContextConfig = Field(default_factory=ContextConfig)
+    checkpoints: CheckpointConfig = Field(default_factory=CheckpointConfig)
+    recovery: RecoveryConfig = Field(default_factory=RecoveryConfig)
 
     def provider(self, name: str | None = None) -> ProviderConfig:
         provider_name = name or self.agent.default_provider

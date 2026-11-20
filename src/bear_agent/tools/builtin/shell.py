@@ -15,10 +15,13 @@ from pydantic import BaseModel, Field
 
 from bear_agent.config.models import ShellConfig
 from bear_agent.core.errors import SandboxError
+from bear_agent.core.fencing import LeaseFence
 from bear_agent.core.modes import ToolSideEffect
 from bear_agent.policy.path_guard import PathAccessError
+from bear_agent.secrets.redaction import SecretRedactor
 from bear_agent.shell.environment import build_shell_env, shell_argv
 from bear_agent.shell.policy import CommandAction, CommandPolicy
+from bear_agent.shell.process_registry import ProcessRegistry
 from bear_agent.shell.runner import ShellResult, ShellRunner
 from bear_agent.shell.sandbox.base import SandboxManager
 from bear_agent.tools.base import (
@@ -67,12 +70,14 @@ class BashTool(Tool):
         workspace: str | Path,
         sandbox: SandboxManager,
         runner: ShellRunner | None = None,
+        process_registry: ProcessRegistry | None = None,
         platform: str | None = None,
     ) -> None:
         self.config = config
         self.workspace = Path(workspace).resolve()
         self.sandbox = sandbox
         self.runner = runner or ShellRunner()
+        self.process_registry = process_registry
         self.platform = platform or sys.platform
         self.policy = CommandPolicy(config, platform=self.platform, workspace=self.workspace)
         self.timeout_s = config.max_timeout_s + 10.0
@@ -151,6 +156,35 @@ class BashTool(Tool):
         except SandboxError as exc:
             return _error(f"sandbox unavailable: {exc}", "sandbox_unavailable")
 
+        async def on_process_start(pid: int, pgid: int | None, command_preview: str) -> str | None:
+            if (
+                self.process_registry is None
+                or not ctx.lease_owner
+                or ctx.lease_epoch is None
+                or not ctx.tool_call_id
+            ):
+                return None
+            redactor = ctx.extras.get("redactor")
+            preview = (
+                redactor.redact(command_preview)
+                if isinstance(redactor, SecretRedactor)
+                else command_preview
+            )
+            record = await self.process_registry.register(
+                ctx.session_id,
+                ctx.tool_call_id,
+                ctx.lease_owner,
+                pid,
+                pgid,
+                preview,
+                fence=LeaseFence(ctx.lease_owner, ctx.lease_epoch),
+            )
+            return record.id
+
+        async def on_process_finish(record_id: str | None) -> None:
+            if self.process_registry is not None and record_id:
+                await self.process_registry.mark_exited(record_id)
+
         result = await self.runner.run(
             args.command,
             sandboxed,
@@ -159,6 +193,8 @@ class BashTool(Tool):
             timeout_s=timeout,
             cancel=ctx.cancel,
             max_output_bytes=self.config.max_output_bytes,
+            on_process_start=on_process_start,
+            on_process_finish=on_process_finish,
         )
         return _to_tool_result(result)
 

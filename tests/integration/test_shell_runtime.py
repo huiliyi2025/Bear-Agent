@@ -50,6 +50,39 @@ async def test_shell_tool_executes_and_audits(workspace: Path, settings) -> None
         assert "tool.started" in actions
         assert "tool.finished" in actions
         assert await container.claims.list_all() == []
+        process_rows = container.db.connection.execute(
+            "SELECT status FROM process_records"
+        ).fetchall()
+        assert process_rows
+        assert all(row["status"] == "exited" for row in process_rows)
+        assert await container.processes.running() == []
+    finally:
+        await container.close()
+
+
+@pytest.mark.asyncio
+async def test_shell_process_record_redacts_command_preview(workspace: Path, settings) -> None:
+    settings.sandbox.mode = "off"
+    secret = "sk-process-preview-secret"
+    container, _provider = make_container(
+        settings,
+        workspace,
+        [
+            tool_script("c1", "bash", {"command": f"echo {secret}"}),
+            text_script("done"),
+        ],
+    )
+    try:
+        container.redactor.register("preview-test", secret)
+        session = await new_session(container, workspace)
+        result = await container.runtime.run(session.id, "echo secret")
+        assert result.status == RunStatus.COMPLETED
+        row = container.db.connection.execute(
+            "SELECT command_preview FROM process_records ORDER BY created_at DESC LIMIT 1"
+        ).fetchone()
+        assert row is not None
+        assert secret not in (row["command_preview"] or "")
+        assert "REDACTED" in (row["command_preview"] or "")
     finally:
         await container.close()
 

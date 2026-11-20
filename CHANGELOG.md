@@ -2,6 +2,40 @@
 
 记录所有重要变更。项目按阶段路线图推进；公开版本发布后使用语义化版本。
 
+## [0.3.0] — 2026-11-19 — 阶段 3：上下文压缩、Checkpoint、恢复与 Fork
+
+### 新增
+
+- 分层上下文压缩：L1 工具输出归档、L2 确定性摘要、L3 模型摘要（失败回退 + 熔断）、L4 Checkpoint 重置；压缩只读 Transcript，原始消息永不修改。
+- Anchor Ledger：自动保留首个目标与约束，支持手工锚点，压缩与 L4 重置后仍注入。
+- 内容寻址 ArtifactStore：原子写入、SHA-256 读取校验、压缩产物与工具输出归档。
+- `read_artifact` 工具：模型可按 artifact id 读回被 L1 归档的完整输出；按 session 隔离，并校验文件完整性。
+- Schema v3/v4：checkpoints、compactions、context_anchors、context_state、process_records、Session Fork 字段、artifact kind/metadata。
+- Checkpoint：单事务快照、checksum、schema version、边界校验、保留策略、损坏/不兼容诊断。
+- Lease Epoch Fencing：Transcript、Event、tool_calls、model_calls、session 状态、Checkpoint、Compaction、Anchor、Process 写入在事务内校验 owner/epoch/expiry；旧 owner 无法污染状态。
+- Session Recovery：启动前恢复、审计链 fail-closed、尾部悬空 tool_call 合成 “unknown/未自动重试”、旧 Claim 清理、孤儿 Shell 进程身份校验后终止、不可修复状态阻塞。
+- Session Fork：从消息位置或 Checkpoint 派生独立会话、安全切点、lineage、Anchors 继承、执行状态/审批/Claim/进程隔离。
+- Runtime：Recovery 接入、逐 Turn Checkpoint、RecoveryError/SessionLeaseError 结构化失败、cleanup 写入顺序修正（释放租约最后）。
+- Shell：进程登记与退出标记，命令预览脱敏。
+- CLI：`sessions fork/recover/checkpoints`；交互 `/compact`、`/anchor`、`/anchors`、`/fork`。
+- 配置：`[context]`、`[checkpoints]`、`[recovery]`。
+
+### 安全与可靠性
+
+- 新增写入全部 fenced；ContextVar ambient fence 阻止被接管的后台任务继续写。
+- Checkpoint 状态、Anchor、artifact、进程命令预览、压缩摘要均经过 SecretRedactor。
+- Recovery 不盲目把 `running` 改成 `failed`，不自动重放有副作用工具。
+- 审计链损坏时恢复 fail-closed；Recovery 事件与审计覆盖所有自动动作。
+- Session Fork 不复制 tool_calls、model_calls、claims、approvals、processes、checkpoints、compactions；project 作用域审批按既有 project ID 语义仍适用。
+
+### 已知限制
+
+- 只自动修复 Transcript 尾部的悬空 tool_call；中间乱序会阻塞并给出人工路径。
+- 孤儿进程终止无法验证身份时选择不杀。
+- L3 摘要调用未计入 `model_calls` 用量。
+- Checkpoint/artifact 无静态加密、外部锚点与自动 GC。
+- Token 估算为启发式；L3 摘要质量依赖模型。
+
 ## [0.2.0] — 2026-11-19 — 阶段 2：Shell 执行与安全
 
 ### 新增

@@ -56,6 +56,25 @@ class EventType(StrEnum):
     # Context
     CONTEXT_BUILT = "context.built"
     CONTEXT_TRUNCATED = "context.truncated"
+    CONTEXT_COMPACTED = "context.compacted"
+    CONTEXT_COMPACTION_FAILED = "context.compaction.failed"
+    CONTEXT_RESET = "context.reset"
+    CONTEXT_ANCHOR_ADDED = "context.anchor.added"
+    CONTEXT_ANCHOR_REMOVED = "context.anchor.removed"
+
+    # Checkpoints and recovery
+    CHECKPOINT_CREATED = "checkpoint.created"
+    CHECKPOINT_INVALID = "checkpoint.invalid"
+    CHECKPOINT_PRUNED = "checkpoint.pruned"
+    RECOVERY_STARTED = "recovery.started"
+    RECOVERY_COMPLETED = "recovery.completed"
+    RECOVERY_FAILED = "recovery.failed"
+    RECOVERY_TOOL_RECONCILED = "recovery.tool.reconciled"
+    RECOVERY_PROCESS_TERMINATED = "recovery.process.terminated"
+    RECOVERY_CLAIMS_RELEASED = "recovery.claims.released"
+
+    # Fork
+    SESSION_FORKED = "session.forked"
 
     # Ephemeral UI events
     MODEL_TEXT_DELTA = "model.text.delta"
@@ -93,6 +112,21 @@ PERSISTED_EVENT_TYPES: frozenset[EventType] = frozenset(
         EventType.CLAIM_CONFLICT,
         EventType.CONTEXT_BUILT,
         EventType.CONTEXT_TRUNCATED,
+        EventType.CONTEXT_COMPACTED,
+        EventType.CONTEXT_COMPACTION_FAILED,
+        EventType.CONTEXT_RESET,
+        EventType.CONTEXT_ANCHOR_ADDED,
+        EventType.CONTEXT_ANCHOR_REMOVED,
+        EventType.CHECKPOINT_CREATED,
+        EventType.CHECKPOINT_INVALID,
+        EventType.CHECKPOINT_PRUNED,
+        EventType.RECOVERY_STARTED,
+        EventType.RECOVERY_COMPLETED,
+        EventType.RECOVERY_FAILED,
+        EventType.RECOVERY_TOOL_RECONCILED,
+        EventType.RECOVERY_PROCESS_TERMINATED,
+        EventType.RECOVERY_CLAIMS_RELEASED,
+        EventType.SESSION_FORKED,
     }
 )
 

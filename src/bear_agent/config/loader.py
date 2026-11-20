@@ -71,6 +71,34 @@ ttl_s = 600
 session_ttl_s = 86400
 project_ttl_s = 2592000
 
+[context]
+# 分层上下文压缩: L1 工具输出归档、L2 确定性摘要、L3 模型摘要、L4 检查点重置。
+compaction_enabled = true
+trigger_ratio = 0.82          # 估算 token 达到可用预算的比例时触发
+keep_recent_turns = 2         # 最近 N 个用户轮次永不压缩
+l1_enabled = true
+l1_min_tool_chars = 4000      # 超过该长度的旧工具输出才会归档
+l1_keep_chars = 1000          # 归档后保留的头部预览长度
+l2_enabled = true
+l2_max_summary_tokens = 1500
+l3_enabled = true             # 允许模型生成摘要; 失败时回退到 L2
+l3_max_input_tokens = 24000
+l3_failure_limit = 3          # 连续失败后熔断
+l3_cooldown_turns = 5         # 熔断后跳过的压缩尝试次数, 跨 Run 计数
+l4_enabled = true
+anchors_enabled = true
+anchor_max_tokens = 800
+
+[checkpoints]
+enabled = true
+interval_turns = 1            # 每 N 个 turn 自动创建检查点; 0 关闭自动创建
+keep = 20                     # 每个会话保留的检查点数量
+
+[recovery]
+enabled = true
+kill_orphan_processes = true
+require_audit = true
+
 # Any OpenAI-compatible endpoint works, including Ollama / vLLM / a relay:
 # [providers.local]
 # type = "openai_compat"
@@ -257,6 +285,15 @@ def settings_to_toml(settings: Settings) -> str:
     lines.extend(["", "[approvals]"])
     lines.append(f"session_ttl_s = {_toml_value(settings.approvals.session_ttl_s)}")
     lines.append(f"project_ttl_s = {_toml_value(settings.approvals.project_ttl_s)}")
+    lines.extend(["", "[context]"])
+    for key, value in settings.context.model_dump().items():
+        lines.append(f"{key} = {_toml_value(value)}")
+    lines.extend(["", "[checkpoints]"])
+    for key, value in settings.checkpoints.model_dump().items():
+        lines.append(f"{key} = {_toml_value(value)}")
+    lines.extend(["", "[recovery]"])
+    for key, value in settings.recovery.model_dump().items():
+        lines.append(f"{key} = {_toml_value(value)}")
     for name, provider in settings.providers.items():
         lines.append("")
         lines.append(f"[providers.{name}]")

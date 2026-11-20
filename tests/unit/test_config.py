@@ -105,3 +105,58 @@ def test_settings_to_toml_omits_api_key(tmp_path: Path, monkeypatch: pytest.Monk
     rendered = settings_to_toml(load_settings(path))
     assert "secret-value" not in rendered
     assert "default_provider" in rendered
+
+
+def test_compaction_and_recovery_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _clear_env(monkeypatch)
+    path = tmp_path / "config.toml"
+    path.write_text(
+        TOML
+        + """
+[context]
+trigger_ratio = 0.7
+keep_recent_turns = 3
+l3_enabled = false
+anchor_max_tokens = 400
+
+[checkpoints]
+interval_turns = 0
+keep = 5
+
+[recovery]
+kill_orphan_processes = false
+require_audit = false
+""",
+        encoding="utf-8",
+    )
+    settings = load_settings(path)
+    assert settings.context.trigger_ratio == 0.7
+    assert settings.context.keep_recent_turns == 3
+    assert settings.context.l3_enabled is False
+    assert settings.context.anchor_max_tokens == 400
+    assert settings.checkpoints.interval_turns == 0
+    assert settings.checkpoints.keep == 5
+    assert settings.recovery.kill_orphan_processes is False
+    assert settings.recovery.require_audit is False
+    rendered = settings_to_toml(settings)
+    assert "[context]" in rendered
+    assert "[checkpoints]" in rendered
+    assert "[recovery]" in rendered
+
+
+def test_invalid_trigger_ratio_rejected(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _clear_env(monkeypatch)
+    path = tmp_path / "config.toml"
+    path.write_text(TOML + "\n[context]\ntrigger_ratio = 1.5\n", encoding="utf-8")
+    with pytest.raises(ConfigError, match="trigger_ratio"):
+        load_settings(path)
+
+
+def test_default_template_parses(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _clear_env(monkeypatch)
+    path = tmp_path / "config.toml"
+    write_default_config(path)
+    settings = load_settings(path)
+    assert settings.context.compaction_enabled is True
+    assert settings.checkpoints.keep == 20
+    assert settings.recovery.require_audit is True

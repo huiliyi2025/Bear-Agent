@@ -6,7 +6,7 @@ Bear-Agent 把模型变成有边界、可观测的执行者：每次工具调用
 
 ## 当前状态
 
-**阶段 2（Shell 执行与安全）已完成。** 当前版本支持：
+**阶段 3（上下文压缩、Checkpoint、恢复与 Fork）已完成。** 当前版本支持：
 
 - 在 OpenAI 兼容流式端点上运行异步 Agent Loop；
 - 执行 Shell 命令：超时、输出上限、进程树终止、取消；
@@ -17,10 +17,13 @@ Bear-Agent 把模型变成有边界、可观测的执行者：每次工具调用
 - API Key 存储在 OS keyring，工具输出、事件、审计记录中的密钥会被脱敏；
 - 维护并验证 Hash Chain 安全审计日志；
 - 阻止多个会话同时写入同一文件或工作区树；
-- 使用历史记录与用量恢复会话；
+- 分层上下文压缩（L1 工具输出归档 → L2 确定性摘要 → L3 模型摘要 → L4 Checkpoint 重置），并用 Anchor Ledger 保留目标与约束；
+- Checkpoint：不可变、带 checksum 与版本的状态快照，可按数量保留；
+- 崩溃恢复：Lease Epoch Fencing、只读 Transcript 对账、合成“状态未知/未自动重试”的工具结果、清理旧 Claim 与孤儿 Shell 进程；
+- Session Fork：从历史位置或 Checkpoint 派生独立会话，不继承执行状态与审批；
 - CLI 流式输出文本与工具状态，或输出 NDJSON 给脚本。
 
-暂未实现（见 [ROADMAP.md](docs/ROADMAP.md)）：上下文压缩、持久化任务引擎、Checkpoint、Hooks、MCP、插件、子代理、完整 TUI。
+暂未实现（见 [ROADMAP.md](docs/ROADMAP.md)）：持久化任务引擎、Hooks、MCP、插件、子代理、完整 TUI。
 
 ## 环境要求
 
@@ -66,6 +69,19 @@ bear run "阅读 README.md，用 5 条要点总结项目"
 bear run "运行测试并报告失败" --permission supervised
 bear run "..." --json     # 输出 NDJSON，供脚本 / CI 使用
 ```
+
+会话检查、恢复与分叉：
+
+```bash
+bear sessions list
+bear sessions show <session-id>
+bear sessions checkpoints <session-id>   # 列出并校验 Checkpoint
+bear sessions recover <session-id>       # 崩溃后手动恢复
+bear sessions fork <session-id> --at 12  # 从第 12 条消息分叉
+bear sessions fork <session-id> --checkpoint <checkpoint-id>
+```
+
+交互模式下可使用 `/compact`、`/anchor <text>`、`/anchors`、`/fork [message_seq]`。
 
 不修改配置文件，直接覆盖 Provider：
 

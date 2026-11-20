@@ -51,7 +51,13 @@ class Database:
         self._conn.execute("PRAGMA busy_timeout=5000")
         self._thread_lock = threading.RLock()
         self._async_lock: asyncio.Lock | None = None
-        migrate(self._conn)
+        try:
+            migrate(self._conn)
+        except BaseException:
+            # A rejected/incompatible database must not leave an open handle
+            # (and its WAL files) behind.
+            self._conn.close()
+            raise
 
     @property
     def connection(self) -> sqlite3.Connection:

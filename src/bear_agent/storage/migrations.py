@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import sqlite3
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 4
 
 
 SCHEMA_V1 = """
@@ -159,6 +159,103 @@ CREATE TABLE IF NOT EXISTS secret_names (
 """
 
 
+SCHEMA_V3 = """
+CREATE TABLE IF NOT EXISTS checkpoints (
+    id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    run_id TEXT,
+    kind TEXT NOT NULL,
+    event_seq INTEGER NOT NULL,
+    message_seq INTEGER NOT NULL,
+    state_json TEXT NOT NULL,
+    checksum TEXT NOT NULL,
+    schema_version INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_checkpoints_session
+    ON checkpoints (session_id, event_seq DESC);
+
+CREATE TABLE IF NOT EXISTS compactions (
+    id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    level INTEGER NOT NULL CHECK (level BETWEEN 1 AND 4),
+    covered_from_message_seq INTEGER NOT NULL,
+    covered_to_message_seq INTEGER NOT NULL,
+    summary_json TEXT NOT NULL,
+    artifact_id TEXT,
+    before_tokens INTEGER NOT NULL,
+    after_tokens INTEGER NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_compactions_session
+    ON compactions (session_id, covered_to_message_seq DESC);
+
+CREATE TABLE IF NOT EXISTS context_anchors (
+    id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    kind TEXT NOT NULL,
+    text TEXT NOT NULL,
+    source_message_seq INTEGER,
+    salience REAL NOT NULL DEFAULT 1.0,
+    active INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_anchors_session
+    ON context_anchors (session_id, active);
+
+CREATE TABLE IF NOT EXISTS context_state (
+    session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+    generation INTEGER NOT NULL DEFAULT 1,
+    last_compaction_id TEXT,
+    consecutive_failures INTEGER NOT NULL DEFAULT 0,
+    disabled_until_turn INTEGER,
+    updated_at TEXT NOT NULL
+);
+"""
+
+
+SCHEMA_V4 = """
+CREATE TABLE IF NOT EXISTS process_records (
+    id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL,
+    tool_call_id TEXT,
+    lease_owner TEXT NOT NULL,
+    pid INTEGER NOT NULL,
+    pgid INTEGER,
+    command_preview TEXT,
+    created_at TEXT NOT NULL,
+    finished_at TEXT,
+    status TEXT NOT NULL CHECK (status IN ('running', 'exited', 'terminated', 'unknown'))
+);
+CREATE INDEX IF NOT EXISTS idx_process_records_session
+    ON process_records (session_id, status);
+"""
+
+
+V3_COLUMNS = (
+    ("sessions", "parent_session_id", "TEXT"),
+    ("sessions", "fork_message_seq", "INTEGER"),
+    ("sessions", "fork_checkpoint_id", "TEXT"),
+    ("artifacts", "kind", "TEXT"),
+    ("artifacts", "metadata_json", "TEXT"),
+)
+
+
+def _column_names(conn: sqlite3.Connection, table: str) -> set[str]:
+    return {str(row[1]) for row in conn.execute(f"PRAGMA table_info({table})")}
+
+
+def _add_column_if_missing(
+    conn: sqlite3.Connection, table: str, column: str, sql_type: str
+) -> None:
+    # A crash can leave a v2 database with some v3 columns already added. The
+    # migration must be retryable instead of failing on "duplicate column".
+    if column in _column_names(conn, table):
+        return
+    conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {sql_type}")
+
+
 def migrate(conn: sqlite3.Connection) -> None:
     conn.execute("CREATE TABLE IF NOT EXISTS schema_meta (version INTEGER NOT NULL)")
     row = conn.execute("SELECT version FROM schema_meta LIMIT 1").fetchone()
@@ -177,4 +274,14 @@ def migrate(conn: sqlite3.Connection) -> None:
     if version < 2:
         conn.executescript(SCHEMA_V2)
         conn.execute("UPDATE schema_meta SET version = 2")
+        version = 2
+    if version < 3:
+        for table, column, sql_type in V3_COLUMNS:
+            _add_column_if_missing(conn, table, column, sql_type)
+        conn.executescript(SCHEMA_V3)
+        conn.execute("UPDATE schema_meta SET version = 3")
+        version = 3
+    if version < 4:
+        conn.executescript(SCHEMA_V4)
+        conn.execute("UPDATE schema_meta SET version = 4")
     conn.commit()
