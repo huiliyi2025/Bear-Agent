@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import posixpath
 import re
 import shlex
 from dataclasses import dataclass, field
@@ -672,6 +673,19 @@ def _is_root_like_target(value: str, workspace: Path) -> bool:
         return True
     if re.fullmatch(r"[a-z]:[\\/]\*?", lowered):
         return True
+    if text.startswith("/"):
+        # Normalize POSIX traversal lexically before touching the filesystem.
+        # On macOS ``/tmp`` is a symlink to ``/private/tmp``, so resolving
+        # ``/tmp/..`` yields ``/private`` even though the command clearly
+        # targets the filesystem root. The lexical form must stay a hard deny.
+        normalized = posixpath.normpath(text)
+        if normalized in {"/", "//"}:
+            return True
+        if normalized.startswith("//"):
+            normalized = "/" + normalized.lstrip("/")
+        parent, _, name = normalized.rpartition("/")
+        if parent == "" and name in {"*", ".*"}:
+            return True
     try:
         path = Path(text)
         if not path.is_absolute():

@@ -44,11 +44,25 @@ def _bwrap_works() -> bool:
 async def test_bwrap_blocks_writes_outside_workspace(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
+    # Create the sensitive file before any wrap: bwrap creates missing mount
+    # points on the writable bind (mode 444), which would pollute the host.
+    (workspace / ".env").write_text("SECRET=should-not-leak", encoding="utf-8")
     outside = tmp_path / "outside.txt"
+    # /tmp is a private tmpfs in this sandbox: ../outside.txt is writable
+    # inside but must not reach the host. A read-only system path must fail.
+    system_target = Path("/usr") / f"bear-agent-outside-{tmp_path.name}.txt"
     sandbox = BwrapSandbox()
-    policy = SandboxPolicy(workspace=workspace, network=False)
+    # This test constructs the policy directly rather than through
+    # SandboxManager, so it must declare the sensitive file it later masks.
+    policy = SandboxPolicy(
+        workspace=workspace,
+        network=False,
+        sensitive_paths=(workspace / ".env",),
+    )
     runner = ShellRunner()
-    command = "echo inside > inside.txt; echo outside > ../outside.txt"
+    command = (
+        f"echo inside > inside.txt; echo outside > ../outside.txt; echo system > {system_target}"
+    )
     sandboxed = sandbox.wrap(
         ["/bin/sh", "-c", command],
         policy,
@@ -66,6 +80,7 @@ async def test_bwrap_blocks_writes_outside_workspace(tmp_path: Path) -> None:
     assert result.exit_code != 0
     assert (workspace / "inside.txt").exists()
     assert not outside.exists()
+    assert not system_target.exists()
 
     command_ok = "echo inside > inside.txt"
     sandboxed_ok = sandbox.wrap(
@@ -85,7 +100,6 @@ async def test_bwrap_blocks_writes_outside_workspace(tmp_path: Path) -> None:
     assert result_ok.exit_code == 0
     assert (workspace / "inside.txt").read_text(encoding="utf-8").strip() == "inside"
 
-    (workspace / ".env").write_text("SECRET=should-not-leak", encoding="utf-8")
     secret_command = "cat .env"
     secret_sandboxed = sandbox.wrap(
         ["/bin/sh", "-c", secret_command],
